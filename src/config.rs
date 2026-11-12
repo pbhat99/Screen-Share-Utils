@@ -111,6 +111,15 @@ pub struct AnnotationConfig {
     /// Font size for text annotations in pixels
     #[serde(default = "default_font_size")]
     pub font_size: f32,
+    /// Hyphen / dash length for dashed/dotted lines (0.0 = round dots, > 0.2 = dashes)
+    #[serde(default = "default_dash_length")]
+    pub dash_length: f32,
+    /// Style for emoji stamps: "flat" (single-color, default) or "color" (multicolor)
+    #[serde(default = "default_emoji_style")]
+    pub emoji_style: String,
+    /// Whether flat emojis are drawn solid filled (true, default) or hollow outline (false)
+    #[serde(default = "default_true")]
+    pub emoji_filled: bool,
     /// Quick color presets available in the palette
     pub color_presets: Vec<[f32; 3]>,
 }
@@ -157,6 +166,12 @@ fn default_toolbar_y() -> f32 {
 fn default_selected_tool() -> String {
     "freehand".to_string()
 }
+fn default_dash_length() -> f32 {
+    3.0
+}
+fn default_emoji_style() -> String {
+    "flat".to_string()
+}
 
 impl Default for AnnotationConfig {
     fn default() -> Self {
@@ -182,6 +197,9 @@ impl Default for AnnotationConfig {
             arrow_wavy: false,
             font_family: "Segoe UI".to_string(),
             font_size: 28.0,
+            dash_length: 3.0,
+            emoji_style: "flat".to_string(),
+            emoji_filled: true,
             recent_emojis: vec![
                 "⭐".into(),
                 "❤️".into(),

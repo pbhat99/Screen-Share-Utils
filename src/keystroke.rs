@@ -58,11 +58,14 @@ impl KeystrokeState {
 
         if is_modifier_or_combo {
             // If the user previously pressed a standalone modifier (e.g. "Shift")
-            // and within 1200ms triggers a combination with it (e.g. "Shift + f(F)"),
+            // and within 1200ms triggers a combination with it (e.g. "F (shift+f)"),
             // replace the standalone modifier badge so it displays the complete chord!
             if let Some(last) = self.active_tokens.last() {
                 let is_standalone_mod = matches!(last.text.as_str(), "Shift" | "Ctrl" | "Alt" | "Win");
-                if is_standalone_mod && key_str.contains(&last.text) && last.last_updated.elapsed() < Duration::from_millis(1200) {
+                if is_standalone_mod
+                    && key_str.to_lowercase().contains(&last.text.to_lowercase())
+                    && last.last_updated.elapsed() < Duration::from_millis(1200)
+                {
                     self.active_tokens.pop();
                 }
             }
@@ -178,7 +181,7 @@ unsafe extern "system" fn low_level_keyboard_proc(code: i32, wparam: WPARAM, lpa
             if win_down { chord.push_str("Win + "); }
             if ctrl_down { chord.push_str("Ctrl + "); }
             if alt_down { chord.push_str("Alt + "); }
-            if shift_down { chord.push_str("Shift + "); }
+            if shift_down && !key_name.contains("(shift+") { chord.push_str("Shift + "); }
 
             chord.push_str(&key_name);
 
@@ -248,7 +251,7 @@ fn format_key(vk: VIRTUAL_KEY, shift: bool) -> String {
                     _ => "",
                 };
                 if !sym.is_empty() {
-                    format!("{}({})", num, sym)
+                    format!("{sym} (shift+{num})")
                 } else {
                     num.to_string()
                 }
@@ -259,7 +262,7 @@ fn format_key(vk: VIRTUAL_KEY, shift: bool) -> String {
         VIRTUAL_KEY(0x41..=0x5A) => {
             let ch = (b'A' + (vk.0 - 0x41) as u8) as char;
             if shift {
-                format!("{}({})", ch.to_lowercase(), ch)
+                format!("{ch} (shift+{})", ch.to_lowercase())
             } else {
                 ch.to_lowercase().to_string()
             }
@@ -273,17 +276,17 @@ fn format_key(vk: VIRTUAL_KEY, shift: bool) -> String {
         VK_DIVIDE => "Num /".into(),
 
         // OEM keys
-        VK_OEM_1 => if shift { ";(:)".into() } else { ";".into() },
-        VK_OEM_PLUS => if shift { "=(+)".into() } else { "=".into() },
-        VK_OEM_COMMA => if shift { ",(<)".into() } else { ",".into() },
-        VK_OEM_MINUS => if shift { "-(_)".into() } else { "-".into() },
-        VK_OEM_PERIOD => if shift { ".(>)".into() } else { ".".into() },
-        VK_OEM_2 => if shift { "/(?)".into() } else { "/".into() },
-        VK_OEM_3 => if shift { "`(~)".into() } else { "`".into() },
-        VK_OEM_4 => if shift { "[({)".into() } else { "[".into() },
-        VK_OEM_5 => if shift { "\\(|)".into() } else { "\\".into() },
-        VK_OEM_6 => if shift { "](})".into() } else { "]".into() },
-        VK_OEM_7 => if shift { "'(\")".into() } else { "'".into() },
+        VK_OEM_1 => if shift { ": (shift+;)".into() } else { ";".into() },
+        VK_OEM_PLUS => if shift { "+ (shift+=)".into() } else { "=".into() },
+        VK_OEM_COMMA => if shift { "< (shift+,)".into() } else { ",".into() },
+        VK_OEM_MINUS => if shift { "_ (shift+-)".into() } else { "-".into() },
+        VK_OEM_PERIOD => if shift { "> (shift+.)".into() } else { ".".into() },
+        VK_OEM_2 => if shift { "? (shift+/)".into() } else { "/".into() },
+        VK_OEM_3 => if shift { "~ (shift+`)".into() } else { "`".into() },
+        VK_OEM_4 => if shift { "{ (shift+[)".into() } else { "[".into() },
+        VK_OEM_5 => if shift { "| (shift+\\)".into() } else { "\\".into() },
+        VK_OEM_6 => if shift { "} (shift+])".into() } else { "]".into() },
+        VK_OEM_7 => if shift { "\" (shift+')".into() } else { "'".into() },
 
         _ => format!("Key_{}", vk.0),
     }
@@ -298,9 +301,9 @@ mod tests {
         assert_eq!(format_key(VK_RETURN, false), "Enter");
         assert_eq!(format_key(VK_SPACE, false), "Space");
         assert_eq!(format_key(VIRTUAL_KEY(0x41), false), "a");
-        assert_eq!(format_key(VIRTUAL_KEY(0x41), true), "a(A)");
-        assert_eq!(format_key(VIRTUAL_KEY(0x46), true), "f(F)");
-        assert_eq!(format_key(VIRTUAL_KEY(0x31), true), "1(!)");
+        assert_eq!(format_key(VIRTUAL_KEY(0x41), true), "A (shift+a)");
+        assert_eq!(format_key(VIRTUAL_KEY(0x46), true), "F (shift+f)");
+        assert_eq!(format_key(VIRTUAL_KEY(0x31), true), "! (shift+1)");
     }
 
     #[test]

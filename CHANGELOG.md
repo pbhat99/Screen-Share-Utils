@@ -4,6 +4,46 @@ All notable changes to **ScreenTools** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.11.1] - 2026-11-12
+### Added
+- **Apply and Cancel Buttons for Settings Window**:
+  - Added a dedicated bottom footer action bar in the Settings Window with styled **Apply** and **Cancel** buttons.
+  - Live status indicator displaying pending unsaved changes or applied status.
+  - **Apply** persists pending modifications to `config.json` and updates the base snapshot.
+  - **Cancel** (and window `WM_CLOSE` or `Escape` key) reverts all live settings back to the initial saved state and closes the dialog.
+### Fixed
+- **Emoji Rotation Support**:
+  - `Shape::Emoji` now tracks `rotation_rad` and renders through a full 2D affine scale + rotation matrix around its position in both single-color and multicolor modes.
+  - Rotating an emoji with the Transform tool smoothly rotates the glyph at any angle.
+- **Bounding Box Shape & Aspect Ratio Invariance on Rotation**:
+  - Implemented `OrientedBoundingBox` for selections, ensuring rotated shapes (rectangles, text, emojis) retain their true, unchanging width, height, and aspect ratio.
+  - Resolved double-rotation and AABB expansion artifacts during and after rotation dragging.
+  - Handle hit-testing transforms cursor coordinates into the local unrotated frame for pixel-accurate handle interaction at all rotation angles.
+
+## [v0.11.0] - 2026-11-09
+### Added
+- **Text Shape Rotation Support**:
+  - `Shape::Text` now supports full 2D affine matrix rotation around its center point when manipulated with the Transform tool.
+  - Rotated text hit-testing and bounding boxes accurately align with rotated coordinates.
+- **Visual Bounding Box Rotation During Drag**:
+  - The transform selection box, dotted outline, rotation stem, and all 8 scale handles rotate dynamically in real time as the user drags the rotation handle.
+  - Resets to the updated axis-aligned bounding box automatically upon mouse release (`WM_LBUTTONUP`).
+- **Dashed Line Hyphen Width Setting**:
+  - Added Slider 26 to the Annotation settings panel: "Dashed Line Hyphen Width (0.0 = Round Dots)" with configurable length from `0.0` to `10.0 px`.
+  - Direct2D dashed stroke styles update dynamically in real time for dashed lines, dashed rectangles, and transform cues.
+- **Flat Emoji & Silhouette Mode Settings**:
+  - Added "Emoji Style" option: `Flat (Single Color)` (default) vs `Multicolor`. Flat emojis adopt the active drawing color.
+  - Added "Emoji Silhouette" option: `Filled` (default) vs `Hollow (Outline)` with punched-out transparent interior outlines.
+### Changed
+- **Keystroke OSD Shift Display Formatting**:
+  - Shift-modified keystrokes now display in `"F (shift+f)"` format (e.g., `"A (shift+a)"`, `"! (shift+1)"`, `"? (shift+/)"`) with single space and lowercase inner representation.
+  - Standalone "Shift" badge seamlessly upgrades to the formatted chord badge without redundant `"Shift + "` prefixes.
+### Fixed
+- **Emoji Opacity Blending**:
+  - Resolved DirectWrite color font glyph palette bypass by rendering emoji stamps inside Direct2D hardware layers (`PushLayer` / `PopLayer` with `D2D1_LAYER_PARAMETERS1`), ensuring stroke opacity sliders properly apply to both multicolor and flat emoji stamps.
+- **Settings UI Layout & Vertical Fit**:
+  - Expanded settings window height to 800px and adjusted card spacing to cleanly accommodate all new sliders, color swatches, emoji controls, and silhouette pills.
+
 ## [v0.10.0] - 2026-11-09
 ### Added
 - **Multi-Selection & Box Marquee (`ActiveTool::Transform`)**:

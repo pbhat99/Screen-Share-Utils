@@ -40,6 +40,7 @@ pub struct D2DRenderer {
     text_format_toolbar_small: IDWriteTextFormat,
     pub round_stroke_style: ID2D1StrokeStyle,
     pub dotted_stroke_style: ID2D1StrokeStyle,
+    cached_dash_length: f32,
 
     osd_bg_bitmap: Option<ID2D1Bitmap>,
     loaded_bg_path: Option<String>,
@@ -216,9 +217,31 @@ impl D2DRenderer {
                 text_format_toolbar_small,
                 round_stroke_style,
                 dotted_stroke_style,
+                cached_dash_length: 3.0,
                 osd_bg_bitmap: None,
                 loaded_bg_path: None,
             })
+        }
+    }
+
+    pub fn update_dashed_stroke_style(&mut self, dash_length: f32) {
+        if (self.cached_dash_length - dash_length).abs() < 0.05 {
+            return;
+        }
+        self.cached_dash_length = dash_length;
+        let dotted_props = D2D1_STROKE_STYLE_PROPERTIES1 {
+            startCap: D2D1_CAP_STYLE_ROUND,
+            endCap: D2D1_CAP_STYLE_ROUND,
+            dashCap: D2D1_CAP_STYLE_ROUND,
+            lineJoin: D2D1_LINE_JOIN_ROUND,
+            miterLimit: 10.0,
+            dashStyle: D2D1_DASH_STYLE_CUSTOM,
+            dashOffset: 0.0,
+            transformType: D2D1_STROKE_TRANSFORM_TYPE_NORMAL,
+        };
+        let dashes = [dash_length.max(0.0), 2.2f32 + dash_length * 0.3];
+        if let Ok(new_style) = unsafe { self.d2d_factory.CreateStrokeStyle(&dotted_props, Some(&dashes)) } {
+            self.dotted_stroke_style = new_style.into();
         }
     }
 
@@ -286,6 +309,8 @@ impl D2DRenderer {
     ) -> Result<()> {
         let cursor_client = self.screen_to_client(cursor_screen);
 
+        self.update_dashed_stroke_style(config.annotation.dash_length);
+
         unsafe {
             self.d2d_context.BeginDraw();
             // Clear to transparent black
@@ -324,6 +349,7 @@ impl D2DRenderer {
                     font_family: text_input.font_family.clone(),
                     font_size: text_input.font_size,
                     color: text_input.color,
+                    rotation_rad: 0.0,
                 };
                 self.draw_shape(&text_shape, 1.0)?;
 
@@ -400,11 +426,30 @@ impl D2DRenderer {
                 }
 
                 // Selection Bounding Box & 8 Scale Handles + Rotation Stem & Handle
-                if let Some((min_pt, max_pt)) = annotation_mgr.get_selection_bounding_box() {
+                if let Some(obb) = annotation_mgr.get_selection_box() {
                     let pad = 6.0;
-                    let box_min = Point2D::new(min_pt.x - pad, min_pt.y - pad);
-                    let box_max = Point2D::new(max_pt.x + pad, max_pt.y + pad);
-                    let center = Point2D::new((box_min.x + box_max.x) * 0.5, (box_min.y + box_max.y) * 0.5);
+                    let hw = obb.half_w + pad;
+                    let hh = obb.half_h + pad;
+                    let center = obb.center;
+
+                    let rot_a = obb.rotation_rad;
+                    let is_rotated = rot_a.abs() > 0.001;
+                    if is_rotated {
+                        let cos_a = rot_a.cos();
+                        let sin_a = rot_a.sin();
+                        let rot_mat = windows::Foundation::Numerics::Matrix3x2 {
+                            M11: cos_a,
+                            M12: sin_a,
+                            M21: -sin_a,
+                            M22: cos_a,
+                            M31: center.x * (1.0 - cos_a) + center.y * sin_a,
+                            M32: center.y * (1.0 - cos_a) - center.x * sin_a,
+                        };
+                        self.d2d_context.SetTransform(&rot_mat);
+                    }
+
+                    let box_min = Point2D::new(center.x - hw, center.y - hh);
+                    let box_max = Point2D::new(center.x + hw, center.y + hh);
 
                     let sel_rect = D2D_RECT_F {
                         left: box_min.x,
@@ -470,6 +515,15 @@ impl D2DRenderer {
                         self.d2d_context.FillRectangle(&h_rect, &handle_fill);
                         self.d2d_context.DrawRectangle(&h_rect, &sel_brush, 1.2, None);
                     }
+
+                    if is_rotated {
+                        let identity = windows::Foundation::Numerics::Matrix3x2 {
+                            M11: 1.0, M12: 0.0,
+                            M21: 0.0, M22: 1.0,
+                            M31: 0.0, M32: 0.0,
+                        };
+                        self.d2d_context.SetTransform(&identity);
+                    }
                 }
 
                 // Hover highlight on unselected shape
@@ -507,12 +561,17 @@ impl D2DRenderer {
                     let size_pct = ((config.annotation.stroke_width - min_w) / (max_w - min_w)).clamp(0.0, 1.0);
                     let emoji_size = 20.0 + size_pct * 70.0;
                     let emoji_op = config.annotation.stroke_opacity.clamp(0.05, 1.0);
+                    let color = config.annotation.current_color;
 
                     let preview_shape = Shape::Emoji {
                         pos: cursor_client,
                         emoji: config.annotation.selected_emoji.clone(),
                         size: emoji_size,
                         opacity: emoji_op,
+                        color: [color[0], color[1], color[2], emoji_op],
+                        flat: config.annotation.emoji_style == "flat",
+                        filled: config.annotation.emoji_filled,
+                        rotation_rad: 0.0,
                     };
                     self.draw_shape(&preview_shape, 0.90)?;
                 } else if active_tool != ActiveTool::None && active_tool != ActiveTool::Transform && active_tool != ActiveTool::Text {
@@ -1146,21 +1205,19 @@ impl D2DRenderer {
                     self.d2d_context.DrawEllipse(&ellipse, &brush, *width, None);
                 }
             }
-            Shape::Emoji { pos, emoji, size, opacity: shape_op } => {
-                let brush = self.render_target.CreateSolidColorBrush(
-                    &D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: *shape_op * opacity },
-                    None,
-                )?;
-
+            Shape::Emoji { pos, emoji, size, opacity: shape_op, color, flat, filled, rotation_rad } => {
+                let eff_opacity = (*shape_op * opacity).clamp(0.01, 1.0);
                 let wide_text: Vec<u16> = emoji.encode_utf16().collect();
                 let s = (*size / 32.0).clamp(0.2, 5.0);
+                let cos_a = rotation_rad.cos();
+                let sin_a = rotation_rad.sin();
                 let transform = windows::Foundation::Numerics::Matrix3x2 {
-                    M11: s,
-                    M12: 0.0,
-                    M21: 0.0,
-                    M22: s,
-                    M31: pos.x * (1.0 - s),
-                    M32: pos.y * (1.0 - s),
+                    M11: s * cos_a,
+                    M12: s * sin_a,
+                    M21: -s * sin_a,
+                    M22: s * cos_a,
+                    M31: pos.x * (1.0 - s * cos_a) + pos.y * (s * sin_a),
+                    M32: pos.y * (1.0 - s * cos_a) - pos.x * (s * sin_a),
                 };
                 let identity = windows::Foundation::Numerics::Matrix3x2 {
                     M11: 1.0,
@@ -1180,17 +1237,88 @@ impl D2DRenderer {
                     bottom: pos.y + base_half,
                 };
 
-                self.d2d_context.DrawText(
-                    &wide_text,
-                    &self.text_format_emoji,
-                    &rect,
-                    &brush,
-                    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
+                let layer_params = D2D1_LAYER_PARAMETERS1 {
+                    contentBounds: rect,
+                    geometricMask: ManuallyDrop::new(None),
+                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    maskTransform: identity,
+                    opacity: eff_opacity,
+                    opacityBrush: ManuallyDrop::new(None),
+                    layerOptions: D2D1_LAYER_OPTIONS1_NONE,
+                };
+                self.d2d_context.PushLayer(&layer_params, None::<&ID2D1Layer>);
+
+                if *flat {
+                    let brush = self.render_target.CreateSolidColorBrush(
+                        &D2D1_COLOR_F { r: color[0], g: color[1], b: color[2], a: color[3] },
+                        None,
+                    )?;
+                    if *filled {
+                        self.d2d_context.DrawText(
+                            &wide_text,
+                            &self.text_format_emoji,
+                            &rect,
+                            &brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    } else {
+                        // Hollow outline: dilate in 8 directions, then punch out the interior
+                        let offsets = [
+                            (-1.5f32, 0.0f32), (1.5, 0.0), (0.0, -1.5), (0.0, 1.5),
+                            (-1.1, -1.1), (1.1, 1.1), (-1.1, 1.1), (1.1, -1.1),
+                        ];
+                        for (dx, dy) in offsets {
+                            let off_rect = D2D_RECT_F {
+                                left: rect.left + dx,
+                                top: rect.top + dy,
+                                right: rect.right + dx,
+                                bottom: rect.bottom + dy,
+                            };
+                            self.d2d_context.DrawText(
+                                &wide_text,
+                                &self.text_format_emoji,
+                                &off_rect,
+                                &brush,
+                                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
+                        }
+
+                        self.d2d_context.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+                        let clear_brush = self.render_target.CreateSolidColorBrush(
+                            &D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+                            None,
+                        )?;
+                        self.d2d_context.DrawText(
+                            &wide_text,
+                            &self.text_format_emoji,
+                            &rect,
+                            &clear_brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                        self.d2d_context.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+                    }
+                } else {
+                    let brush = self.render_target.CreateSolidColorBrush(
+                        &D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                        None,
+                    )?;
+                    self.d2d_context.DrawText(
+                        &wide_text,
+                        &self.text_format_emoji,
+                        &rect,
+                        &brush,
+                        D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+
+                self.d2d_context.PopLayer();
                 self.d2d_context.SetTransform(&identity);
             }
-            Shape::Text { pos, text, font_family, font_size, color } => {
+            Shape::Text { pos, text, font_family, font_size, color, rotation_rad } => {
                 let brush = self.render_target.CreateSolidColorBrush(
                     &D2D1_COLOR_F {
                         r: color[0],
@@ -1214,6 +1342,26 @@ impl D2DRenderer {
                     let wide_text: Vec<u16> = text.encode_utf16().collect();
                     let approx_w = (text.len() as f32 * font_size * 0.8).max(500.0);
                     let approx_h = (font_size * 2.0).max(100.0);
+
+                    let is_rotated = rotation_rad.abs() > 0.001;
+                    if is_rotated {
+                        let text_w = (text.len() as f32 * font_size * 0.6).max(24.0);
+                        let text_h = (*font_size * 1.3).max(24.0);
+                        let cx = pos.x + text_w * 0.5;
+                        let cy = pos.y + text_h * 0.5;
+                        let cos_a = rotation_rad.cos();
+                        let sin_a = rotation_rad.sin();
+                        let rot_transform = windows::Foundation::Numerics::Matrix3x2 {
+                            M11: cos_a,
+                            M12: sin_a,
+                            M21: -sin_a,
+                            M22: cos_a,
+                            M31: cx * (1.0 - cos_a) + cy * sin_a,
+                            M32: cy * (1.0 - cos_a) - cx * sin_a,
+                        };
+                        self.d2d_context.SetTransform(&rot_transform);
+                    }
+
                     let rect = D2D_RECT_F {
                         left: pos.x,
                         top: pos.y,
@@ -1228,6 +1376,18 @@ impl D2DRenderer {
                         D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
+
+                    if is_rotated {
+                        let identity = windows::Foundation::Numerics::Matrix3x2 {
+                            M11: 1.0,
+                            M12: 0.0,
+                            M21: 0.0,
+                            M22: 1.0,
+                            M31: 0.0,
+                            M32: 0.0,
+                        };
+                        self.d2d_context.SetTransform(&identity);
+                    }
                 }
             }
         }

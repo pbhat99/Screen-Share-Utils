@@ -1056,7 +1056,23 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                         let size_pct = ((app.config.annotation.stroke_width - min_w) / (max_w - min_w)).clamp(0.0, 1.0);
                         let emoji_size = 20.0 + size_pct * 70.0;
                         let emoji = app.config.annotation.selected_emoji.clone();
-                        app.annotation_mgr.add_emoji_stamp(client_pt, &emoji, emoji_size, app.config.annotation.stroke_opacity);
+                        let color_rgba = [
+                            app.config.annotation.current_color[0],
+                            app.config.annotation.current_color[1],
+                            app.config.annotation.current_color[2],
+                            app.config.annotation.stroke_opacity,
+                        ];
+                        let flat = app.config.annotation.emoji_style == "flat";
+                        let filled = app.config.annotation.emoji_filled;
+                        app.annotation_mgr.add_emoji_stamp(
+                            client_pt,
+                            &emoji,
+                            emoji_size,
+                            app.config.annotation.stroke_opacity,
+                            color_rgba,
+                            flat,
+                            filled,
+                        );
                         app.needs_render = true;
                     }
                     ActiveTool::Eraser => {

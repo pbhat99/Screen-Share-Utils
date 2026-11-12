@@ -46,6 +46,10 @@ pub enum Shape {
         emoji: String,
         size: f32,
         opacity: f32,
+        color: [f32; 4],
+        flat: bool,
+        filled: bool,
+        rotation_rad: f32,
     },
     Text {
         pos: Point2D,
@@ -53,6 +57,7 @@ pub enum Shape {
         font_family: String,
         font_size: f32,
         color: [f32; 4],
+        rotation_rad: f32,
     },
 }
 
@@ -124,14 +129,28 @@ impl Shape {
             Shape::Emoji { pos, size, .. } => {
                 p.distance_to(*pos) <= (*size * 0.75 + tolerance)
             }
-            Shape::Text { pos, text, font_size, .. } => {
-                let approx_w = (text.len() as f32 * font_size * 0.6).max(24.0);
+            Shape::Text { pos, text, font_size, rotation_rad, .. } => {
+                let approx_w = (text.len() as f32 * *font_size * 0.6).max(24.0);
                 let approx_h = (*font_size * 1.3).max(24.0);
                 let r = tolerance.max(6.0);
-                p.x >= pos.x - r
-                    && p.x <= pos.x + approx_w + r
-                    && p.y >= pos.y - r
-                    && p.y <= pos.y + approx_h + r
+                if rotation_rad.abs() > 0.001 {
+                    let cx = pos.x + approx_w * 0.5;
+                    let cy = pos.y + approx_h * 0.5;
+                    let cos_a = (-rotation_rad).cos();
+                    let sin_a = (-rotation_rad).sin();
+                    let dx = p.x - cx;
+                    let dy = p.y - cy;
+                    let unrot = Point2D::new(cx + dx * cos_a - dy * sin_a, cy + dx * sin_a + dy * cos_a);
+                    unrot.x >= pos.x - r
+                        && unrot.x <= pos.x + approx_w + r
+                        && unrot.y >= pos.y - r
+                        && unrot.y <= pos.y + approx_h + r
+                } else {
+                    p.x >= pos.x - r
+                        && p.x <= pos.x + approx_w + r
+                        && p.y >= pos.y - r
+                        && p.y <= pos.y + approx_h + r
+                }
             }
         }
     }
@@ -265,11 +284,18 @@ impl Shape {
             Shape::Ellipse { center, .. } => {
                 *center = rot_pt(*center);
             }
-            Shape::Emoji { pos, .. } => {
+            Shape::Emoji { pos, rotation_rad, .. } => {
                 *pos = rot_pt(*pos);
+                *rotation_rad += angle_rad;
             }
-            Shape::Text { pos, .. } => {
-                *pos = rot_pt(*pos);
+            Shape::Text { pos, text, font_size, rotation_rad, .. } => {
+                let approx_w = (text.len() as f32 * *font_size * 0.6).max(24.0);
+                let approx_h = (*font_size * 1.3).max(24.0);
+                let center = Point2D::new(pos.x + approx_w * 0.5, pos.y + approx_h * 0.5);
+                let new_center = rot_pt(center);
+                pos.x = new_center.x - approx_w * 0.5;
+                pos.y = new_center.y - approx_h * 0.5;
+                *rotation_rad += angle_rad;
             }
         }
     }
@@ -336,17 +362,59 @@ impl Shape {
                     Point2D::new(center.x + rx, center.y + ry),
                 )
             }
-            Shape::Emoji { pos, size, .. } => {
-                let half = size * 0.5;
-                (Point2D::new(pos.x - half, pos.y - half), Point2D::new(pos.x + half, pos.y + half))
+            Shape::Emoji { pos, size, rotation_rad, .. } => {
+                let half = *size * 0.5;
+                if rotation_rad.abs() > 0.001 {
+                    let cos_r = rotation_rad.cos();
+                    let sin_r = rotation_rad.sin();
+                    let corners = [(-half, -half), (half, -half), (half, half), (-half, half)];
+                    let mut min_x = f32::MAX;
+                    let mut min_y = f32::MAX;
+                    let mut max_x = f32::MIN;
+                    let mut max_y = f32::MIN;
+                    for (x, y) in corners {
+                        let px = pos.x + x * cos_r - y * sin_r;
+                        let py = pos.y + x * sin_r + y * cos_r;
+                        min_x = min_x.min(px);
+                        min_y = min_y.min(py);
+                        max_x = max_x.max(px);
+                        max_y = max_y.max(py);
+                    }
+                    (Point2D::new(min_x, min_y), Point2D::new(max_x, max_y))
+                } else {
+                    (Point2D::new(pos.x - half, pos.y - half), Point2D::new(pos.x + half, pos.y + half))
+                }
             }
-            Shape::Text { pos, text, font_size, .. } => {
-                let approx_w = (text.len() as f32 * font_size * 0.6).max(24.0);
+            Shape::Text { pos, text, font_size, rotation_rad, .. } => {
+                let approx_w = (text.len() as f32 * *font_size * 0.6).max(24.0);
                 let approx_h = (*font_size * 1.3).max(24.0);
-                (
-                    Point2D::new(pos.x, pos.y),
-                    Point2D::new(pos.x + approx_w, pos.y + approx_h),
-                )
+                if rotation_rad.abs() > 0.001 {
+                    let cx = pos.x + approx_w * 0.5;
+                    let cy = pos.y + approx_h * 0.5;
+                    let hw = approx_w * 0.5;
+                    let hh = approx_h * 0.5;
+                    let cos_r = rotation_rad.cos();
+                    let sin_r = rotation_rad.sin();
+                    let corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)];
+                    let mut min_x = f32::MAX;
+                    let mut min_y = f32::MAX;
+                    let mut max_x = f32::MIN;
+                    let mut max_y = f32::MIN;
+                    for (x, y) in corners {
+                        let px = cx + x * cos_r - y * sin_r;
+                        let py = cy + x * sin_r + y * cos_r;
+                        min_x = min_x.min(px);
+                        min_y = min_y.min(py);
+                        max_x = max_x.max(px);
+                        max_y = max_y.max(py);
+                    }
+                    (Point2D::new(min_x, min_y), Point2D::new(max_x, max_y))
+                } else {
+                    (
+                        Point2D::new(pos.x, pos.y),
+                        Point2D::new(pos.x + approx_w, pos.y + approx_h),
+                    )
+                }
             }
         }
     }
@@ -412,6 +480,14 @@ pub enum TransformHandle {
     ScaleLeft,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct OrientedBoundingBox {
+    pub center: Point2D,
+    pub half_w: f32,
+    pub half_h: f32,
+    pub rotation_rad: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct LaserTrailPoint {
     pub pos: Point2D,
@@ -435,6 +511,7 @@ pub struct AnnotationManager {
     pub transform_initial_box: Option<(Point2D, Point2D)>,
     pub marquee_start: Option<Point2D>,
     pub marquee_current: Option<Point2D>,
+    pub transform_rotation_angle: f32,
 }
 
 impl AnnotationManager {
@@ -454,6 +531,7 @@ impl AnnotationManager {
             transform_initial_box: None,
             marquee_start: None,
             marquee_current: None,
+            transform_rotation_angle: 0.0,
         }
     }
 
@@ -503,6 +581,7 @@ impl AnnotationManager {
         self.transform_initial_box = None;
         self.marquee_start = None;
         self.marquee_current = None;
+        self.transform_rotation_angle = 0.0;
         if !self.shapes.is_empty() {
             self.push_undo();
             self.shapes.clear();
@@ -689,13 +768,26 @@ impl AnnotationManager {
         }
     }
 
-    pub fn add_emoji_stamp(&mut self, pos: Point2D, emoji: &str, size: f32, opacity: f32) {
+    pub fn add_emoji_stamp(
+        &mut self,
+        pos: Point2D,
+        emoji: &str,
+        size: f32,
+        opacity: f32,
+        color: [f32; 4],
+        flat: bool,
+        filled: bool,
+    ) {
         self.push_undo();
         self.shapes.push(Shape::Emoji {
             pos,
             emoji: emoji.to_string(),
             size,
             opacity: opacity.clamp(0.05, 1.0),
+            color,
+            flat,
+            filled,
+            rotation_rad: 0.0,
         });
     }
 
@@ -726,6 +818,85 @@ impl AnnotationManager {
             }
         }
         None
+    }
+
+    /// Retrieve the oriented bounding box of the active selection.
+    /// Preserves constant width, height, and aspect ratio under rotation!
+    pub fn get_selection_box(&self) -> Option<OrientedBoundingBox> {
+        if self.selected_indices.is_empty() {
+            return None;
+        }
+
+        // If actively dragging the rotation handle, use initial snapshot bounds
+        // so dimensions and aspect ratio remain 100% rigid while rotating!
+        if self.active_transform_handle == Some(TransformHandle::Rotate) {
+            if let Some((b_min, b_max)) = self.transform_initial_box {
+                let center = Point2D::new((b_min.x + b_max.x) * 0.5, (b_min.y + b_max.y) * 0.5);
+                let half_w = (b_max.x - b_min.x) * 0.5;
+                let half_h = (b_max.y - b_min.y) * 0.5;
+                return Some(OrientedBoundingBox {
+                    center,
+                    half_w,
+                    half_h,
+                    rotation_rad: self.transform_rotation_angle,
+                });
+            }
+        }
+
+        // Single selected shape: preserve intrinsic orientation & unrotated aspect ratio
+        if self.selected_indices.len() == 1 {
+            let idx = self.selected_indices[0];
+            if idx < self.shapes.len() {
+                match &self.shapes[idx] {
+                    Shape::Rect { p1, p2, rotation_rad, .. } => {
+                        let center = Point2D::new((p1.x + p2.x) * 0.5, (p1.y + p2.y) * 0.5);
+                        let half_w = (p2.x - p1.x).abs() * 0.5;
+                        let half_h = (p2.y - p1.y).abs() * 0.5;
+                        return Some(OrientedBoundingBox {
+                            center,
+                            half_w,
+                            half_h,
+                            rotation_rad: *rotation_rad,
+                        });
+                    }
+                    Shape::Text { pos, text, font_size, rotation_rad, .. } => {
+                        let approx_w = (text.len() as f32 * font_size * 0.6).max(24.0);
+                        let approx_h = (*font_size * 1.3).max(24.0);
+                        let half_w = approx_w * 0.5;
+                        let half_h = approx_h * 0.5;
+                        let center = Point2D::new(pos.x + half_w, pos.y + half_h);
+                        return Some(OrientedBoundingBox {
+                            center,
+                            half_w,
+                            half_h,
+                            rotation_rad: *rotation_rad,
+                        });
+                    }
+                    Shape::Emoji { pos, size, rotation_rad, .. } => {
+                        let half = *size * 0.5;
+                        return Some(OrientedBoundingBox {
+                            center: *pos,
+                            half_w: half,
+                            half_h: half,
+                            rotation_rad: *rotation_rad,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Union bounding box for multiple shapes
+        let (min_pt, max_pt) = self.get_selection_bounding_box()?;
+        let center = Point2D::new((min_pt.x + max_pt.x) * 0.5, (min_pt.y + max_pt.y) * 0.5);
+        let half_w = (max_pt.x - min_pt.x) * 0.5;
+        let half_h = (max_pt.y - min_pt.y) * 0.5;
+        Some(OrientedBoundingBox {
+            center,
+            half_w,
+            half_h,
+            rotation_rad: 0.0,
+        })
     }
 
     /// Retrieve the union bounding box of all currently selected shapes
@@ -759,50 +930,66 @@ impl AnnotationManager {
 
     /// Hit test against selection handles (rotate handle, 8 scale handles, or inside selection box)
     pub fn hit_test_transform_handle(&self, p: Point2D) -> Option<TransformHandle> {
-        let (min_pt, max_pt) = self.get_selection_bounding_box()?;
+        let obb = self.get_selection_box()?;
         let pad = 6.0;
-        let box_min = Point2D::new(min_pt.x - pad, min_pt.y - pad);
-        let box_max = Point2D::new(max_pt.x + pad, max_pt.y + pad);
-        let center = Point2D::new((box_min.x + box_max.x) * 0.5, (box_min.y + box_max.y) * 0.5);
+        let hw = obb.half_w + pad;
+        let hh = obb.half_h + pad;
+        let center = obb.center;
 
+        // Transform mouse point into local (unrotated) box coordinate system
+        let p_local = if obb.rotation_rad.abs() > 0.001 {
+            let cos_a = (-obb.rotation_rad).cos();
+            let sin_a = (-obb.rotation_rad).sin();
+            let dx = p.x - center.x;
+            let dy = p.y - center.y;
+            Point2D::new(
+                center.x + dx * cos_a - dy * sin_a,
+                center.y + dx * sin_a + dy * cos_a,
+            )
+        } else {
+            p
+        };
+
+        let box_min = Point2D::new(center.x - hw, center.y - hh);
+        let box_max = Point2D::new(center.x + hw, center.y + hh);
         let handle_radius = 8.0;
 
         // 1. Rotation handle (circle 24px above top center)
         let rot_pos = Point2D::new(center.x, box_min.y - 24.0);
-        if p.distance_to(rot_pos) <= handle_radius + 2.0 {
+        if p_local.distance_to(rot_pos) <= handle_radius + 2.0 {
             return Some(TransformHandle::Rotate);
         }
 
         // 2. Corner scale handles
-        if p.distance_to(box_min) <= handle_radius {
+        if p_local.distance_to(box_min) <= handle_radius {
             return Some(TransformHandle::ScaleTopLeft);
         }
-        if p.distance_to(Point2D::new(box_max.x, box_min.y)) <= handle_radius {
+        if p_local.distance_to(Point2D::new(box_max.x, box_min.y)) <= handle_radius {
             return Some(TransformHandle::ScaleTopRight);
         }
-        if p.distance_to(box_max) <= handle_radius {
+        if p_local.distance_to(box_max) <= handle_radius {
             return Some(TransformHandle::ScaleBottomRight);
         }
-        if p.distance_to(Point2D::new(box_min.x, box_max.y)) <= handle_radius {
+        if p_local.distance_to(Point2D::new(box_min.x, box_max.y)) <= handle_radius {
             return Some(TransformHandle::ScaleBottomLeft);
         }
 
         // 3. Edge scale handles
-        if p.distance_to(Point2D::new(center.x, box_min.y)) <= handle_radius {
+        if p_local.distance_to(Point2D::new(center.x, box_min.y)) <= handle_radius {
             return Some(TransformHandle::ScaleTop);
         }
-        if p.distance_to(Point2D::new(center.x, box_max.y)) <= handle_radius {
+        if p_local.distance_to(Point2D::new(center.x, box_max.y)) <= handle_radius {
             return Some(TransformHandle::ScaleBottom);
         }
-        if p.distance_to(Point2D::new(box_min.x, center.y)) <= handle_radius {
+        if p_local.distance_to(Point2D::new(box_min.x, center.y)) <= handle_radius {
             return Some(TransformHandle::ScaleLeft);
         }
-        if p.distance_to(Point2D::new(box_max.x, center.y)) <= handle_radius {
+        if p_local.distance_to(Point2D::new(box_max.x, center.y)) <= handle_radius {
             return Some(TransformHandle::ScaleRight);
         }
 
         // 4. Move: inside bounding box or clicking on any selected shape
-        if crate::geometry::point_in_rect(p, box_min, box_max) {
+        if crate::geometry::point_in_rect(p_local, box_min, box_max) {
             return Some(TransformHandle::Move);
         }
         for &idx in &self.selected_indices {
@@ -865,12 +1052,15 @@ impl AnnotationManager {
         self.transform_initial_box = None;
         self.marquee_start = None;
         self.marquee_current = None;
+        self.transform_rotation_angle = 0.0;
+        self.transform_rotation_angle = 0.0;
     }
 
     /// Start a transform operation (Move, Rotate, Scale) with the active handle
     pub fn start_transform(&mut self, handle: TransformHandle, start_pt: Point2D) {
         self.active_transform_handle = Some(handle);
         self.transform_drag_start = start_pt;
+        self.transform_rotation_angle = 0.0;
         let (snapshot, bbox) = self.begin_transform();
         self.transform_initial_shapes = snapshot;
         self.transform_initial_box = bbox;
@@ -923,6 +1113,7 @@ impl AnnotationManager {
                     let step = std::f32::consts::PI / 12.0; // 15-degree increments
                     total_angle = (total_angle / step).round() * step;
                 }
+                self.transform_rotation_angle = total_angle;
 
                 for (idx, initial_shape) in &self.transform_initial_shapes {
                     if *idx < self.shapes.len() {
@@ -1037,6 +1228,7 @@ impl AnnotationManager {
         self.active_transform_handle = None;
         self.transform_initial_shapes.clear();
         self.transform_initial_box = None;
+        self.transform_rotation_angle = 0.0;
     }
 
     /// Cancel active transform and restore initial pre-drag state
@@ -1051,6 +1243,7 @@ impl AnnotationManager {
         }
         self.marquee_start = None;
         self.marquee_current = None;
+        self.transform_rotation_angle = 0.0;
     }
 
     /// Start a marquee box selection
@@ -1109,6 +1302,7 @@ impl AnnotationManager {
                     font_family: input.font_family,
                     font_size: input.font_size,
                     color: input.color,
+                    rotation_rad: 0.0,
                 });
                 return true;
             }
@@ -1377,6 +1571,63 @@ mod tests {
         // 5. Undo restores deleted shape
         assert!(mgr.undo());
         assert_eq!(mgr.shapes.len(), 1);
+    }
+
+    #[test]
+    fn test_text_and_emoji_rotation_and_config() {
+        let mut mgr = AnnotationManager::new();
+        mgr.shapes.push(Shape::Text {
+            pos: Point2D::new(100.0, 100.0),
+            text: "Hello".to_string(),
+            font_family: "Segoe UI".to_string(),
+            font_size: 24.0,
+            color: [1.0, 1.0, 1.0, 1.0],
+            rotation_rad: 0.0,
+        });
+        mgr.selected_indices = vec![0];
+        let (min_pt, max_pt) = mgr.get_selection_bounding_box().unwrap();
+        let center = Point2D::new((min_pt.x + max_pt.x) * 0.5, (min_pt.y + max_pt.y) * 0.5);
+
+        // Rotate text shape by 90 degrees (PI / 2)
+        mgr.shapes[0].rotate(center, std::f32::consts::FRAC_PI_2);
+        if let Shape::Text { rotation_rad, .. } = &mgr.shapes[0] {
+            assert!((*rotation_rad - std::f32::consts::FRAC_PI_2).abs() < 0.001);
+        } else {
+            panic!("Expected Text shape");
+        }
+
+        // Add emoji stamp with flat & filled options
+        mgr.add_emoji_stamp(
+            Point2D::new(50.0, 50.0),
+            "🔥",
+            32.0,
+            0.8,
+            [1.0, 0.5, 0.0, 0.8],
+            true,
+            false,
+        );
+        assert_eq!(mgr.shapes.len(), 2);
+        if let Shape::Emoji { emoji, flat, filled, opacity, .. } = &mgr.shapes[1] {
+            assert_eq!(emoji, "🔥");
+            assert!(*flat);
+            assert!(!*filled);
+            assert_eq!(*opacity, 0.8);
+        } else {
+            panic!("Expected Emoji shape");
+        }
+
+        // Rotate emoji
+        mgr.shapes[1].rotate(Point2D::new(50.0, 50.0), std::f32::consts::FRAC_PI_2);
+        if let Shape::Emoji { rotation_rad, .. } = &mgr.shapes[1] {
+            assert!((*rotation_rad - std::f32::consts::FRAC_PI_2).abs() < 0.001);
+        } else {
+            panic!("Expected Emoji shape");
+        }
+
+        // Check that oriented bounding box preserves aspect ratio!
+        mgr.selected_indices = vec![0];
+        let obb = mgr.get_selection_box().unwrap();
+        assert!((obb.rotation_rad - std::f32::consts::FRAC_PI_2).abs() < 0.001);
     }
 }
 

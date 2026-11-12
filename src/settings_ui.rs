@@ -145,13 +145,19 @@ pub struct SettingsWindow {
     width: u32,
     height: u32,
     is_dragging_slider: Option<usize>,
+    pub saved_config: AppConfig,
+    pub has_unapplied_changes: bool,
 }
 
 impl SettingsWindow {
     pub fn open(config: Arc<Mutex<AppConfig>>, on_change: Option<Box<dyn Fn() + Send + 'static>>) -> Result<()> {
         unsafe {
-            if let Some(ref instance) = SETTINGS_INSTANCE {
+            if let Some(ref mut instance) = SETTINGS_INSTANCE {
                 if IsWindow(instance.hwnd).as_bool() {
+                    if let Ok(c) = instance.config.lock() {
+                        instance.saved_config = c.clone();
+                    }
+                    instance.has_unapplied_changes = false;
                     let _ = ShowWindow(instance.hwnd, SW_SHOWNORMAL);
                     let _ = SetForegroundWindow(instance.hwnd);
                     instance.update_tab_visibility();
@@ -178,7 +184,7 @@ impl SettingsWindow {
             let _ = RegisterClassExW(&wnd_class);
 
             let width = 780;
-            let height = 750;
+            let height = 840;
 
             let primary_w = GetSystemMetrics(SM_CXSCREEN);
             let primary_h = GetSystemMetrics(SM_CYSCREEN);
@@ -202,7 +208,7 @@ impl SettingsWindow {
 
             // Create child EDIT control for custom emojis
             let edit_x = 46;
-            let edit_y = 634;
+            let edit_y = 666;
             let edit_w = 120;
             let edit_h = 26;
 
@@ -316,6 +322,12 @@ impl SettingsWindow {
             let _ = text_format_tab.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
             let _ = text_format_tab.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
+            let saved_config = if let Ok(c) = config.lock() {
+                c.clone()
+            } else {
+                AppConfig::default()
+            };
+
             let mut win = Box::new(Self {
                 hwnd,
                 hwnd_edit_emoji,
@@ -334,6 +346,8 @@ impl SettingsWindow {
                 width: width as u32,
                 height: height as u32,
                 is_dragging_slider: None,
+                saved_config,
+                has_unapplied_changes: false,
             });
 
             win.update_tab_visibility();
@@ -380,7 +394,7 @@ impl SettingsWindow {
     pub fn update_tab_visibility(&self) {
         unsafe {
             if self.active_tab == SettingsTab::Annotation {
-                let edit_y = 634;
+                let edit_y = 666;
                 let _ = SetWindowPos(
                     self.hwnd_edit_emoji,
                     HWND::default(),
@@ -395,6 +409,34 @@ impl SettingsWindow {
             } else {
                 let _ = ShowWindow(self.hwnd_edit_emoji, SW_HIDE);
             }
+        }
+    }
+
+    pub fn apply_changes(&mut self) {
+        if let Ok(c) = self.config.lock() {
+            let _ = c.save();
+            self.saved_config = c.clone();
+        }
+        self.has_unapplied_changes = false;
+        if let Some(ref cb) = self.on_change {
+            cb();
+        }
+        self.trigger_repaint();
+    }
+
+    pub fn cancel_changes(&mut self) {
+        if self.has_unapplied_changes {
+            if let Ok(mut c) = self.config.lock() {
+                *c = self.saved_config.clone();
+                let _ = c.save();
+            }
+            self.has_unapplied_changes = false;
+            if let Some(ref cb) = self.on_change {
+                cb();
+            }
+        }
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
     }
 
@@ -540,6 +582,86 @@ impl SettingsWindow {
                     self.render_osd_tab(rt, &cfg, cx, cy)?;
                 }
             }
+
+            // 4. Bottom Footer Action Bar: Apply & Cancel
+            let footer_y = (self.height as f32 - 48.0).max(752.0);
+            let btn_h = 32.0;
+
+            // Subtle divider line above footer
+            let div_brush = rt.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.22, g: 0.25, b: 0.32, a: 0.7 }, None)?;
+            rt.DrawLine(
+                D2D_POINT_2F { x: 24.0, y: footer_y - 12.0 },
+                D2D_POINT_2F { x: self.width as f32 - 24.0, y: footer_y - 12.0 },
+                &div_brush,
+                1.0,
+                None,
+            );
+
+            // Left status indicator
+            let status_rect = D2D_RECT_F {
+                left: 24.0,
+                top: footer_y + 6.0,
+                right: 480.0,
+                bottom: footer_y + btn_h,
+            };
+            if self.has_unapplied_changes {
+                let pend_brush = rt.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.95, g: 0.75, b: 0.30, a: 1.0 }, None)?;
+                let pend_msg: Vec<u16> = "● Unsaved changes pending — click Apply to save".encode_utf16().collect();
+                rt.DrawText(&pend_msg, &self.text_format_small, &status_rect, &pend_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            } else {
+                let saved_brush = rt.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.45, g: 0.75, b: 0.55, a: 0.8 }, None)?;
+                let saved_msg: Vec<u16> = "✓ All settings applied".encode_utf16().collect();
+                rt.DrawText(&saved_msg, &self.text_format_small, &status_rect, &saved_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            }
+
+            // Right buttons: Cancel and Apply
+            let apply_w = 110.0;
+            let cancel_w = 95.0;
+            let apply_x = self.width as f32 - 24.0 - apply_w;
+            let cancel_x = apply_x - 12.0 - cancel_w;
+
+            // Cancel Button
+            let cancel_rect = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F { left: cancel_x, top: footer_y, right: cancel_x + cancel_w, bottom: footer_y + btn_h },
+                radiusX: 6.0,
+                radiusY: 6.0,
+            };
+            let c_bg = rt.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.16, g: 0.18, b: 0.23, a: 1.0 }, None)?;
+            let c_border = rt.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.32, g: 0.36, b: 0.45, a: 1.0 }, None)?;
+            let c_text_brush = rt.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.90, g: 0.92, b: 0.96, a: 1.0 }, None)?;
+            rt.FillRoundedRectangle(&cancel_rect, &c_bg);
+            rt.DrawRoundedRectangle(&cancel_rect, &c_border, 1.0, None);
+            let cancel_lbl: Vec<u16> = "Cancel".encode_utf16().collect();
+            let c_text_rect = D2D_RECT_F { left: cancel_x, top: footer_y + 6.0, right: cancel_x + cancel_w, bottom: footer_y + btn_h };
+            rt.DrawText(&cancel_lbl, &self.text_format_tab, &c_text_rect, &c_text_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+
+            // Apply Button
+            let apply_rect = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F { left: apply_x, top: footer_y, right: apply_x + apply_w, bottom: footer_y + btn_h },
+                radiusX: 6.0,
+                radiusY: 6.0,
+            };
+            let (a_bg_col, a_border_col, a_text_col) = if self.has_unapplied_changes {
+                (
+                    D2D1_COLOR_F { r: 0.20, g: 0.45, b: 0.88, a: 1.0 },
+                    D2D1_COLOR_F { r: 0.45, g: 0.70, b: 1.0, a: 1.0 },
+                    D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                )
+            } else {
+                (
+                    D2D1_COLOR_F { r: 0.14, g: 0.18, b: 0.26, a: 0.7 },
+                    D2D1_COLOR_F { r: 0.22, g: 0.28, b: 0.38, a: 0.6 },
+                    D2D1_COLOR_F { r: 0.50, g: 0.60, b: 0.75, a: 0.8 },
+                )
+            };
+            let a_bg = rt.CreateSolidColorBrush(&a_bg_col, None)?;
+            let a_border = rt.CreateSolidColorBrush(&a_border_col, None)?;
+            let a_text_brush = rt.CreateSolidColorBrush(&a_text_col, None)?;
+            rt.FillRoundedRectangle(&apply_rect, &a_bg);
+            rt.DrawRoundedRectangle(&apply_rect, &a_border, 1.2, None);
+            let apply_lbl: Vec<u16> = (if self.has_unapplied_changes { "Apply" } else { "Applied" }).encode_utf16().collect();
+            let a_text_rect = D2D_RECT_F { left: apply_x, top: footer_y + 6.0, right: apply_x + apply_w, bottom: footer_y + btn_h };
+            rt.DrawText(&apply_lbl, &self.text_format_tab, &a_text_rect, &a_text_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
 
             rt.EndDraw(None, None)?;
         }
@@ -933,7 +1055,7 @@ impl SettingsWindow {
 
     unsafe fn render_annotation_tab(&self, rt: &ID2D1HwndRenderTarget, cfg: &AppConfig, cx: f32, cy: f32) -> Result<()> {
         let card_w = 732.0;
-        let card_h = 360.0;
+        let card_h = 394.0;
         self.render_card(rt, D2D_RECT_F { left: cx, top: cy, right: cx + card_w, bottom: cy + card_h })?;
 
         let ix = cx + 22.0;
@@ -1017,10 +1139,15 @@ impl SettingsWindow {
         // 8. Max Stroke Width (15.0 .. 60.0 px) (Slider 22)
         let max_w_frac = ((cfg.annotation.max_stroke_width - 15.0) / 45.0).clamp(0.0, 1.0);
         self.render_slider(rt, "Maximum Stroke Width (100% on Control Panel slider)", &format!("{:.1} px", cfg.annotation.max_stroke_width), max_w_frac, ix, iy, cw)?;
+        iy += 38.0;
+
+        // 9. Dashed Line Hyphen Width (0.0 .. 10.0 px) (Slider 26)
+        let dash_frac = (cfg.annotation.dash_length / 10.0).clamp(0.0, 1.0);
+        self.render_slider(rt, "Dashed Line Hyphen Width (0.0 = Round Dots)", &format!("{:.1} px", cfg.annotation.dash_length), dash_frac, ix, iy, cw)?;
 
         // Card 2: Palette, Emoji Stamps, and Tools
-        let card2_y = cy + card_h + 12.0;
-        let card2_h = 220.0;
+        let card2_y = cy + card_h + 10.0;
+        let card2_h = 214.0;
         self.render_card(rt, D2D_RECT_F { left: cx, top: card2_y, right: cx + card_w, bottom: card2_y + card2_h })?;
 
         let mut iy2 = card2_y + 12.0;
@@ -1159,6 +1286,87 @@ impl SettingsWindow {
         let count_brush = rt.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.55, g: 0.58, b: 0.65, a: 1.0 }, None)?;
         let count_rect = D2D_RECT_F { left: btn_x + btn_w + 12.0, top: btn_y + 5.0, right: ix + cw, bottom: btn_y + btn_h };
         rt.DrawText(&count_wide, &self.text_format_small, &count_rect, &count_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+        iy2 += 34.0;
+
+        // Emoji Style & Silhouette Options
+        let opt_h = 26.0;
+
+        // 1. Emoji Style: Flat vs Multicolor
+        let style_title: Vec<u16> = "Emoji Style:".encode_utf16().collect();
+        rt.DrawText(&style_title, &self.text_format_heading, &D2D_RECT_F { left: ix, top: iy2 + 3.0, right: ix + 90.0, bottom: iy2 + opt_h }, &heading_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+
+        let style_pills = [("Flat (Single Color)", "flat", 135.0), ("Multicolor", "color", 95.0)];
+        let mut curr_x = ix + 95.0;
+        for (label, val, pw) in style_pills {
+            let p_rect = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F { left: curr_x, top: iy2, right: curr_x + pw, bottom: iy2 + opt_h },
+                radiusX: 6.0,
+                radiusY: 6.0,
+            };
+            let is_sel = cfg.annotation.emoji_style == val;
+            let (bg_c, border_c, text_c) = if is_sel {
+                (
+                    D2D1_COLOR_F { r: 0.22, g: 0.38, b: 0.75, a: 1.0 },
+                    D2D1_COLOR_F { r: 0.45, g: 0.70, b: 1.0, a: 1.0 },
+                    D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                )
+            } else {
+                (
+                    D2D1_COLOR_F { r: 0.14, g: 0.16, b: 0.22, a: 0.9 },
+                    D2D1_COLOR_F { r: 0.24, g: 0.27, b: 0.35, a: 0.7 },
+                    D2D1_COLOR_F { r: 0.75, g: 0.78, b: 0.85, a: 1.0 },
+                )
+            };
+            let b_brush = rt.CreateSolidColorBrush(&bg_c, None)?;
+            rt.FillRoundedRectangle(&p_rect, &b_brush);
+            let brd_brush = rt.CreateSolidColorBrush(&border_c, None)?;
+            rt.DrawRoundedRectangle(&p_rect, &brd_brush, if is_sel { 1.5 } else { 1.0 }, None);
+
+            let txt_brush = rt.CreateSolidColorBrush(&text_c, None)?;
+            let lbl_wide: Vec<u16> = label.encode_utf16().collect();
+            let text_box = D2D_RECT_F { left: curr_x, top: iy2 + 4.0, right: curr_x + pw, bottom: iy2 + opt_h };
+            rt.DrawText(&lbl_wide, &self.text_format_tab, &text_box, &txt_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            curr_x += pw + 8.0;
+        }
+
+        // 2. Emoji Silhouette: Filled vs Hollow
+        let sil_title_x = curr_x + 20.0;
+        let sil_title: Vec<u16> = "Silhouette:".encode_utf16().collect();
+        rt.DrawText(&sil_title, &self.text_format_heading, &D2D_RECT_F { left: sil_title_x, top: iy2 + 3.0, right: sil_title_x + 85.0, bottom: iy2 + opt_h }, &heading_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+
+        let sil_pills = [("Filled", true, 75.0), ("Hollow (Outline)", false, 120.0)];
+        let mut curr_sil_x = sil_title_x + 85.0;
+        for (label, val, pw) in sil_pills {
+            let p_rect = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F { left: curr_sil_x, top: iy2, right: curr_sil_x + pw, bottom: iy2 + opt_h },
+                radiusX: 6.0,
+                radiusY: 6.0,
+            };
+            let is_sel = cfg.annotation.emoji_filled == val;
+            let (bg_c, border_c, text_c) = if is_sel {
+                (
+                    D2D1_COLOR_F { r: 0.22, g: 0.38, b: 0.75, a: 1.0 },
+                    D2D1_COLOR_F { r: 0.45, g: 0.70, b: 1.0, a: 1.0 },
+                    D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                )
+            } else {
+                (
+                    D2D1_COLOR_F { r: 0.14, g: 0.16, b: 0.22, a: 0.9 },
+                    D2D1_COLOR_F { r: 0.24, g: 0.27, b: 0.35, a: 0.7 },
+                    D2D1_COLOR_F { r: 0.75, g: 0.78, b: 0.85, a: 1.0 },
+                )
+            };
+            let b_brush = rt.CreateSolidColorBrush(&bg_c, None)?;
+            rt.FillRoundedRectangle(&p_rect, &b_brush);
+            let brd_brush = rt.CreateSolidColorBrush(&border_c, None)?;
+            rt.DrawRoundedRectangle(&p_rect, &brd_brush, if is_sel { 1.5 } else { 1.0 }, None);
+
+            let txt_brush = rt.CreateSolidColorBrush(&text_c, None)?;
+            let lbl_wide: Vec<u16> = label.encode_utf16().collect();
+            let text_box = D2D_RECT_F { left: curr_sil_x, top: iy2 + 4.0, right: curr_sil_x + pw, bottom: iy2 + opt_h };
+            rt.DrawText(&lbl_wide, &self.text_format_tab, &text_box, &txt_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            curr_sil_x += pw + 8.0;
+        }
 
         Ok(())
     }
@@ -1237,16 +1445,31 @@ impl SettingsWindow {
     }
 
     pub fn handle_mouse_down(&mut self, x: f32, y: f32) {
+        // 0. Footer Action Bar: Apply & Cancel
+        let footer_y = (self.height as f32 - 48.0).max(752.0);
+        let btn_h = 32.0;
+        let apply_w = 110.0;
+        let cancel_w = 95.0;
+        let apply_x = self.width as f32 - 24.0 - apply_w;
+        let cancel_x = apply_x - 12.0 - cancel_w;
+
+        if y >= footer_y && y <= footer_y + btn_h {
+            if x >= apply_x && x <= apply_x + apply_w {
+                self.apply_changes();
+                return;
+            }
+            if x >= cancel_x && x <= cancel_x + cancel_w {
+                self.cancel_changes();
+                return;
+            }
+        }
+
         // Reset Defaults button (Top Right: 606..756, 18..52)
         if y >= 18.0 && y <= 52.0 && x >= 606.0 && x <= 756.0 {
             if let Ok(mut c) = self.config.lock() {
                 *c = AppConfig::default();
-                let _ = c.save();
             }
-            if let Some(ref cb) = self.on_change {
-                cb();
-            }
-            self.trigger_repaint();
+            self.notify_change();
             return;
         }
 
@@ -1453,10 +1676,16 @@ impl SettingsWindow {
                     self.update_slider(22, x, ix, cw);
                     return;
                 }
+                // Slider 26: Dashed line hyphen width
+                if y >= cy + 332.0 && y <= cy + 370.0 && x >= ix && x <= ix + cw {
+                    self.is_dragging_slider = Some(26);
+                    self.update_slider(26, x, ix, cw);
+                    return;
+                }
 
-                // Card 2 elements (card2_y = 490.0)
+                // Card 2 elements (card2_y = 522.0)
                 let is_synced = self.config.lock().map(|c| c.sync_colors).unwrap_or(false);
-                let swatch_y = 538.0;
+                let swatch_y = 570.0;
                 let swatch_size = 32.0;
                 let swatch_gap = 12.0;
 
@@ -1480,7 +1709,7 @@ impl SettingsWindow {
                 }
 
                 // Emoji Swatches (up to 9 custom emojis)
-                let emoji_y = 596.0;
+                let emoji_y = 628.0;
                 let e_size = 32.0;
                 let e_gap = 10.0;
                 if y >= emoji_y && y <= emoji_y + e_size {
@@ -1502,14 +1731,65 @@ impl SettingsWindow {
                     }
                 }
 
-                // [+ Add Emoji] button click (ix + 128.0 .. ix + 238.0, 634.0 .. 660.0)
+                // [+ Add Emoji] button click (ix + 128.0 .. ix + 238.0, 666.0 .. 692.0)
                 let btn_x = ix + 128.0;
-                let btn_y = 634.0;
+                let btn_y = 666.0;
                 let btn_w = 110.0;
                 let btn_h = 26.0;
                 if x >= btn_x && x <= btn_x + btn_w && y >= btn_y && y <= btn_y + btn_h {
                     self.add_emoji_from_input();
                     return;
+                }
+
+                // Emoji Style & Silhouette Options (opts_y = 700.0 .. 726.0)
+                let opts_y = 700.0;
+                let opt_h = 26.0;
+                if y >= opts_y && y <= opts_y + opt_h {
+                    // Emoji Style: Flat vs Multicolor
+                    let flat_x1 = ix + 95.0;
+                    let flat_x2 = flat_x1 + 135.0;
+                    let color_x1 = flat_x2 + 8.0;
+                    let color_x2 = color_x1 + 95.0;
+
+                    if x >= flat_x1 && x <= flat_x2 {
+                        if let Ok(mut c) = self.config.lock() {
+                            c.annotation.emoji_style = "flat".to_string();
+                            let _ = c.save();
+                        }
+                        self.notify_change();
+                        return;
+                    }
+                    if x >= color_x1 && x <= color_x2 {
+                        if let Ok(mut c) = self.config.lock() {
+                            c.annotation.emoji_style = "color".to_string();
+                            let _ = c.save();
+                        }
+                        self.notify_change();
+                        return;
+                    }
+
+                    // Emoji Silhouette: Filled vs Hollow
+                    let filled_x1 = color_x2 + 28.0 + 85.0;
+                    let filled_x2 = filled_x1 + 75.0;
+                    let hollow_x1 = filled_x2 + 8.0;
+                    let hollow_x2 = hollow_x1 + 120.0;
+
+                    if x >= filled_x1 && x <= filled_x2 {
+                        if let Ok(mut c) = self.config.lock() {
+                            c.annotation.emoji_filled = true;
+                            let _ = c.save();
+                        }
+                        self.notify_change();
+                        return;
+                    }
+                    if x >= hollow_x1 && x <= hollow_x2 {
+                        if let Ok(mut c) = self.config.lock() {
+                            c.annotation.emoji_filled = false;
+                            let _ = c.save();
+                        }
+                        self.notify_change();
+                        return;
+                    }
                 }
             }
             SettingsTab::Osd => {
@@ -1646,7 +1926,7 @@ impl SettingsWindow {
                 }
             }
             SettingsTab::Annotation => {
-                let swatch_y = 538.0;
+                let swatch_y = 570.0;
                 let swatch_size = 32.0;
                 let swatch_gap = 12.0;
                 if y >= swatch_y && y <= swatch_y + swatch_size {
@@ -1687,7 +1967,7 @@ impl SettingsWindow {
                 }
 
                 // Custom emoji slot right-click to delete emoji
-                let emoji_y = 596.0;
+                let emoji_y = 628.0;
                 let e_size = 32.0;
                 let e_gap = 10.0;
                 if y >= emoji_y && y <= emoji_y + e_size {
@@ -1752,6 +2032,7 @@ impl SettingsWindow {
                 23 => c.annotation.toolbar_opacity = (0.40 + frac * 0.60).clamp(0.40, 1.0),
                 24 => c.annotation.stroke_opacity = (0.05 + frac * 0.95).clamp(0.05, 1.0),
                 25 => c.annotation.font_size = (12.0 + frac * 60.0).round(),
+                26 => c.annotation.dash_length = (frac * 10.0 * 10.0).round() / 10.0,
                 31 => c.osd.stay_duration_ms = (500.0 + frac * 4500.0) as u64,
                 32 => c.osd.fade_duration_ms = (100.0 + frac * 900.0) as u64,
                 33 => c.osd.font_size = 16.0 + frac * 28.0,
@@ -1764,6 +2045,7 @@ impl SettingsWindow {
     }
 
     fn notify_change(&mut self) {
+        self.has_unapplied_changes = true;
         if let Some(ref cb) = self.on_change {
             cb();
         }
@@ -1834,13 +2116,13 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM,
 
         WM_KEYDOWN => {
             if wparam.0 == VK_ESCAPE.0 as usize {
-                let _ = ShowWindow(hwnd, SW_HIDE);
+                settings.cancel_changes();
             }
             LRESULT(0)
         }
 
         WM_CLOSE => {
-            let _ = ShowWindow(hwnd, SW_HIDE);
+            settings.cancel_changes();
             LRESULT(0)
         }
 
@@ -1943,5 +2225,45 @@ mod tests {
         assert_eq!(cfg.annotation.custom_emojis.len(), 9);
         assert_eq!(cfg.annotation.selected_emoji, "🎉");
         assert!(cfg.annotation.custom_emojis.contains(&"🎉".to_string()));
+    }
+
+    #[test]
+    fn test_annotation_new_config_options() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.annotation.dash_length, 3.0);
+        assert_eq!(cfg.annotation.emoji_style, "flat");
+        assert!(cfg.annotation.emoji_filled);
+    }
+
+    #[test]
+    fn test_settings_apply_and_cancel_logic() {
+        let original_cfg = AppConfig::default();
+        let mut saved_cfg = original_cfg.clone();
+        let mut working_cfg = original_cfg.clone();
+
+        // User makes changes in settings dialog
+        working_cfg.annotation.dash_length = 7.5;
+        working_cfg.highlighter.size = 85.0;
+        let mut has_unapplied_changes = true;
+
+        // Cancel restores saved config
+        if has_unapplied_changes {
+            working_cfg = saved_cfg.clone();
+            has_unapplied_changes = false;
+        }
+        assert_eq!(working_cfg.annotation.dash_length, original_cfg.annotation.dash_length);
+        assert_eq!(working_cfg.highlighter.size, original_cfg.highlighter.size);
+        assert!(!has_unapplied_changes);
+
+        // User makes another change and clicks Apply
+        working_cfg.annotation.dash_length = 5.0;
+        has_unapplied_changes = true;
+        assert!(has_unapplied_changes);
+        saved_cfg = working_cfg.clone();
+        has_unapplied_changes = false;
+
+        assert_eq!(saved_cfg.annotation.dash_length, 5.0);
+        assert_eq!(working_cfg.annotation.dash_length, 5.0);
+        assert!(!has_unapplied_changes);
     }
 }
