@@ -4,6 +4,37 @@ All notable changes to **ScreenTools** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.12.0] - 2026-11-12
+### Added
+- **Single-Instance Enforcement & Persistent Config Path**:
+  - Added a per-session named mutex (`Local\ScreenToolsSingleInstanceMutex`) at startup so only one instance of ScreenTools runs at a time.
+  - Resolved `screen_tools_config.json` relative to the executable directory and preserved dragged floating panel coordinates across tool switches, Settings actions, and restarts.
+- **Live Dynamic Backdrop for Invert, Burn & Dodge**:
+  - Incremental dirty-region screen capture (`refresh_live_effect_backdrop`) dynamically updates **Invert**, **Burn**, and **Dodge** annotations when underlying screen content changes (scrolling, window movement, animations, or app switches).
+  - Overlapping **Burn** and **Dodge** strokes progressively accumulate/pile up via an incremental GPU accumulation bitmap and `DESTINATION_IN` mask compositing.
+- **3-Button-Per-Row Floating Drawing Panel Layout (`128 × 270 px`)**:
+  - **Row 1**: `Pen / Text` toggle — `Burn / Dodge` toggle — `Eraser / Transform` toggle (each toggle independently remembers its last state when switching to other tools).
+  - **Row 2**: `Shapes` (3×3 flyout on 1st click) — `Emoji` (3×3 flyout) — `Color / Invert` (3×3 flyout with fixed center **Invert**).
+  - **Sliders**: Wider `116 px` rounded-edge pill sliders (no circular thumb dots) ordered **Softness** (`🌫`, 1st) → **Opacity** (`💧`) → **Size** (`📏`).
+  - **Row 4**: `Undo` (75% open arc arrow) — `Redo` (75% open arc arrow) — `Clear`.
+  - **Row 5**: `Hide/Show Annotations` (`👁` acts as lock/unlock: hiding drawings releases mouse input back to the OS and disables all drawing buttons, flyouts, sliders, and undo/redo/clear while keeping panel drag, Eye unlock, Settings, and Exit active) — `Settings` (`⚙` opens Settings window directly) — `Exit` (`✕`).
+- **Per-Tool Size, Opacity & Softness with Cross-Tool Sync Toggle**:
+  - Each drawing tool independently remembers its own Stroke Size, Opacity, and Edge Softness (`CLSID_D2D1GaussianBlur` for `Freehand`, `Burn`, `Dodge`).
+  - Added a **Sync Tool Size / Opacity / Softness** toggle (default OFF) in Settings → Annotation.
+- **Editable Slider Values & Expanded Keystroke OSD Settings**:
+  - Every slider in the Settings window now includes an interactive numeric input box (click any value to type an exact number, press `Enter` or click elsewhere to commit, `Esc` to cancel).
+  - Added **Keystroke OSD** Background Color swatches + custom color picker, Background Opacity slider, 3×3 Screen Position alignment grid, Screen Edge Offset slider (`0–200 px`), Target Monitor selector (`Active (Cursor)`, `Primary Display`, or individual enumerated monitors), dynamic OSD badge font sizing, and luminance-aware text contrast.
+### Changed
+- **Flat, Borderless Buttons & Multi-Monitor Flyouts**:
+  - Removed button outlines and avoided gradients across panel buttons; anchored Row 2 flyouts neatly next to the panel within the active monitor work area.
+  - Replaced slider circular thumb dots with pure rounded-edge pill bars across both the floating panel and Settings window.
+  - Reduced default `color_presets` from 9 to 8 outer presets (automatically migrating legacy 9-swatch configs by removing index 4).
+- **Cleaner, Eyes-Friendly Settings Layout**:
+  - Switched slider names, toggle labels, value boxes, and pill buttons to regular (non-bold) font weight with a calmer slate palette and paired 2-column slider sections.
+### Removed
+- **Static Settings Live Preview Cards**:
+  - Removed the redundant static preview boxes from Highlighter, Laser Pointer, and Keystroke OSD settings tabs since live changes render directly in the active tools.
+
 ## [v0.11.1] - 2026-11-12
 ### Added
 - **Apply and Cancel Buttons for Settings Window**:

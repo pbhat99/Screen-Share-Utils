@@ -3,12 +3,24 @@ use crate::geometry::{
 };
 use std::time::Instant;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScreenEffectMode {
+    #[default]
+    Normal,
+    Invert,
+    Burn,
+    Dodge,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Shape {
     Freehand {
         points: Vec<Point2D>,
         color: [f32; 4],
         width: f32,
+        softness: f32,
+        effect: ScreenEffectMode,
+        snapshot_id: usize,
     },
     Line {
         start: Point2D,
@@ -17,6 +29,8 @@ pub enum Shape {
         width: f32,
         dotted: bool,
         wavy: bool,
+        effect: ScreenEffectMode,
+        snapshot_id: usize,
     },
     Arrow {
         start: Point2D,
@@ -24,6 +38,8 @@ pub enum Shape {
         color: [f32; 4],
         width: f32,
         wavy: bool,
+        effect: ScreenEffectMode,
+        snapshot_id: usize,
     },
     Rect {
         p1: Point2D,
@@ -32,6 +48,8 @@ pub enum Shape {
         width: f32,
         fill: bool,
         rotation_rad: f32,
+        effect: ScreenEffectMode,
+        snapshot_id: usize,
     },
     Ellipse {
         center: Point2D,
@@ -40,6 +58,8 @@ pub enum Shape {
         color: [f32; 4],
         width: f32,
         fill: bool,
+        effect: ScreenEffectMode,
+        snapshot_id: usize,
     },
     Emoji {
         pos: Point2D,
@@ -50,6 +70,8 @@ pub enum Shape {
         flat: bool,
         filled: bool,
         rotation_rad: f32,
+        effect: ScreenEffectMode,
+        snapshot_id: usize,
     },
     Text {
         pos: Point2D,
@@ -58,6 +80,8 @@ pub enum Shape {
         font_size: f32,
         color: [f32; 4],
         rotation_rad: f32,
+        effect: ScreenEffectMode,
+        snapshot_id: usize,
     },
 }
 
@@ -68,9 +92,22 @@ pub struct ActiveTextInput {
     pub font_family: String,
     pub font_size: f32,
     pub color: [f32; 4],
+    pub effect: ScreenEffectMode,
+    pub snapshot_id: usize,
 }
 
 impl Shape {
+    pub fn screen_effect(&self) -> (ScreenEffectMode, usize) {
+        match self {
+            Shape::Freehand { effect, snapshot_id, .. }
+            | Shape::Line { effect, snapshot_id, .. }
+            | Shape::Arrow { effect, snapshot_id, .. }
+            | Shape::Rect { effect, snapshot_id, .. }
+            | Shape::Ellipse { effect, snapshot_id, .. }
+            | Shape::Emoji { effect, snapshot_id, .. }
+            | Shape::Text { effect, snapshot_id, .. } => (*effect, *snapshot_id),
+        }
+    }
     /// Hit-test: checks if `point` is close to or on this shape within `tolerance`.
     pub fn hit_test(&self, p: Point2D, tolerance: f32) -> bool {
         match self {
@@ -429,6 +466,8 @@ pub enum ActiveTool {
     Arrow,
     Rect,
     Ellipse,
+    Burn,
+    Dodge,
     Emoji,
     Eraser,
     Transform,
@@ -443,6 +482,8 @@ impl ActiveTool {
             ActiveTool::Arrow => "arrow",
             ActiveTool::Rect => "rect",
             ActiveTool::Ellipse => "ellipse",
+            ActiveTool::Burn => "burn",
+            ActiveTool::Dodge => "dodge",
             ActiveTool::Emoji => "emoji",
             ActiveTool::Eraser => "eraser",
             ActiveTool::Transform => "transform",
@@ -458,11 +499,27 @@ impl ActiveTool {
             "arrow" => ActiveTool::Arrow,
             "rect" => ActiveTool::Rect,
             "ellipse" => ActiveTool::Ellipse,
+            "burn" => ActiveTool::Burn,
+            "dodge" => ActiveTool::Dodge,
             "emoji" => ActiveTool::Emoji,
             "eraser" => ActiveTool::Eraser,
             "transform" => ActiveTool::Transform,
             _ => ActiveTool::Freehand,
         }
+    }
+
+    pub fn is_shape(&self) -> bool {
+        matches!(
+            self,
+            ActiveTool::Line | ActiveTool::Arrow | ActiveTool::Rect | ActiveTool::Ellipse
+        )
+    }
+
+    pub fn supports_softness(&self) -> bool {
+        matches!(
+            self,
+            ActiveTool::Freehand | ActiveTool::Burn | ActiveTool::Dodge
+        )
     }
 }
 
@@ -503,6 +560,7 @@ pub struct AnnotationManager {
     pub selected_indices: Vec<usize>,
     pub hovered_shape_idx: Option<usize>,
     pub laser_points: Vec<LaserTrailPoint>,
+    pub annotations_hidden: bool,
 
     // Transform & Marquee selection state
     pub active_transform_handle: Option<TransformHandle>,
@@ -525,6 +583,7 @@ impl AnnotationManager {
             selected_indices: Vec::new(),
             hovered_shape_idx: None,
             laser_points: Vec::new(),
+            annotations_hidden: false,
             active_transform_handle: None,
             transform_drag_start: Point2D::new(0.0, 0.0),
             transform_initial_shapes: Vec::new(),
@@ -595,18 +654,50 @@ impl AnnotationManager {
         color: [f32; 3],
         width: f32,
         opacity: f32,
+        softness: f32,
         fill: bool,
         dotted: bool,
         line_wavy: bool,
         arrow_wavy: bool,
+        effect: ScreenEffectMode,
+        snapshot_id: usize,
     ) {
+        self.annotations_hidden = false;
         let rgba = [color[0], color[1], color[2], opacity.clamp(0.05, 1.0)];
+        let eff_softness = if tool.supports_softness() {
+            softness.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         match tool {
             ActiveTool::Freehand => {
                 self.in_progress = Some(Shape::Freehand {
                     points: vec![start_pos],
                     color: rgba,
                     width,
+                    softness: eff_softness,
+                    effect,
+                    snapshot_id,
+                });
+            }
+            ActiveTool::Burn => {
+                self.in_progress = Some(Shape::Freehand {
+                    points: vec![start_pos],
+                    color: rgba,
+                    width,
+                    softness: eff_softness,
+                    effect: ScreenEffectMode::Burn,
+                    snapshot_id,
+                });
+            }
+            ActiveTool::Dodge => {
+                self.in_progress = Some(Shape::Freehand {
+                    points: vec![start_pos],
+                    color: rgba,
+                    width,
+                    softness: eff_softness,
+                    effect: ScreenEffectMode::Dodge,
+                    snapshot_id,
                 });
             }
             ActiveTool::Line => {
@@ -617,6 +708,8 @@ impl AnnotationManager {
                     width,
                     dotted,
                     wavy: line_wavy,
+                    effect,
+                    snapshot_id,
                 });
             }
             ActiveTool::Arrow => {
@@ -626,6 +719,8 @@ impl AnnotationManager {
                     color: rgba,
                     width,
                     wavy: arrow_wavy,
+                    effect,
+                    snapshot_id,
                 });
             }
             ActiveTool::Rect => {
@@ -636,6 +731,8 @@ impl AnnotationManager {
                     width,
                     fill,
                     rotation_rad: 0.0,
+                    effect,
+                    snapshot_id,
                 });
             }
             ActiveTool::Ellipse => {
@@ -646,6 +743,8 @@ impl AnnotationManager {
                     color: rgba,
                     width,
                     fill,
+                    effect,
+                    snapshot_id,
                 });
             }
             _ => {}
@@ -753,10 +852,14 @@ impl AnnotationManager {
 
     pub fn finish_drawing(&mut self) -> bool {
         if let Some(mut shape) = self.in_progress.take() {
-            if let Shape::Freehand { ref mut points, .. } = shape {
+            if let Shape::Freehand { ref mut points, effect, .. } = shape {
                 // Simplify freehand points using Ramer-Douglas-Peucker to remove jitter while preserving Bezier curvature
                 *points = simplify_polyline(points, 1.2);
-                if points.len() < 2 {
+                if points.len() == 1 && matches!(effect, ScreenEffectMode::Burn | ScreenEffectMode::Dodge) {
+                    // Allow single-click dabs with Burn/Dodge brush
+                    let p0 = points[0];
+                    points.push(Point2D::new(p0.x + 0.5, p0.y));
+                } else if points.len() < 2 {
                     return false;
                 }
             }
@@ -777,6 +880,8 @@ impl AnnotationManager {
         color: [f32; 4],
         flat: bool,
         filled: bool,
+        effect: ScreenEffectMode,
+        snapshot_id: usize,
     ) {
         self.push_undo();
         self.shapes.push(Shape::Emoji {
@@ -788,6 +893,8 @@ impl AnnotationManager {
             flat,
             filled,
             rotation_rad: 0.0,
+            effect,
+            snapshot_id,
         });
     }
 
@@ -1279,7 +1386,15 @@ impl AnnotationManager {
     }
 
     /// Begin typing text at the given clicked position
-    pub fn start_text_input(&mut self, pos: Point2D, font_family: String, font_size: f32, color: [f32; 4]) {
+    pub fn start_text_input(
+        &mut self,
+        pos: Point2D,
+        font_family: String,
+        font_size: f32,
+        color: [f32; 4],
+        effect: ScreenEffectMode,
+        snapshot_id: usize,
+    ) {
         self.commit_active_text();
         self.active_text = Some(ActiveTextInput {
             pos,
@@ -1287,6 +1402,8 @@ impl AnnotationManager {
             font_family,
             font_size,
             color,
+            effect,
+            snapshot_id,
         });
     }
 
@@ -1303,11 +1420,46 @@ impl AnnotationManager {
                     font_size: input.font_size,
                     color: input.color,
                     rotation_rad: 0.0,
+                    effect: input.effect,
+                    snapshot_id: input.snapshot_id,
                 });
                 return true;
             }
         }
         false
+    }
+
+    /// Return all desktop snapshot IDs still referenced by active, in-progress, undo, or redo shapes
+    pub fn referenced_snapshot_ids(&self) -> Vec<usize> {
+        let mut ids = Vec::new();
+        if let Some(ref t) = self.active_text {
+            if t.effect != ScreenEffectMode::Normal && t.snapshot_id != 0 {
+                ids.push(t.snapshot_id);
+            }
+        }
+        let mut collect = |shape: &Shape| {
+            let (eff, id) = shape.screen_effect();
+            if eff != ScreenEffectMode::Normal && id != 0 && !ids.contains(&id) {
+                ids.push(id);
+            }
+        };
+        for s in &self.shapes {
+            collect(s);
+        }
+        if let Some(ref s) = self.in_progress {
+            collect(s);
+        }
+        for stack_frame in &self.undo_stack {
+            for s in stack_frame {
+                collect(s);
+            }
+        }
+        for stack_frame in &self.redo_stack {
+            for s in stack_frame {
+                collect(s);
+            }
+        }
+        ids
     }
 
     pub fn add_laser_point(&mut self, pos: Point2D) -> bool {
@@ -1417,7 +1569,7 @@ mod tests {
     fn test_shift_snapping_and_circle_constraint() {
         let mut mgr = AnnotationManager::new();
         // Line with shift held: 45 deg snap
-        mgr.start_drawing(ActiveTool::Line, Point2D::new(0.0, 0.0), [1.0, 0.0, 0.0], 2.0, 1.0, false, false, false, false);
+        mgr.start_drawing(ActiveTool::Line, Point2D::new(0.0, 0.0), [1.0, 0.0, 0.0], 2.0, 1.0, 0.0, false, false, false, false, ScreenEffectMode::Normal, 0);
         // Drag to (100.0, 20.0) -> raw angle ~11 deg -> snaps to 0 deg
         mgr.update_drawing(Point2D::new(100.0, 20.0), true);
         if let Some(Shape::Line { start, end, .. }) = mgr.in_progress {
@@ -1429,7 +1581,7 @@ mod tests {
         mgr.finish_drawing();
 
         // Ellipse with shift held: rx == ry (circle)
-        mgr.start_drawing(ActiveTool::Ellipse, Point2D::new(100.0, 100.0), [1.0, 0.0, 0.0], 2.0, 1.0, false, false, false, false);
+        mgr.start_drawing(ActiveTool::Ellipse, Point2D::new(100.0, 100.0), [1.0, 0.0, 0.0], 2.0, 1.0, 0.0, false, false, false, false, ScreenEffectMode::Normal, 0);
         mgr.update_drawing(Point2D::new(180.0, 130.0), true);
         if let Some(Shape::Ellipse { rx, ry, .. }) = mgr.in_progress {
             assert_eq!(rx, ry); // Perfect circle!
@@ -1451,10 +1603,42 @@ mod tests {
             ActiveTool::Emoji,
             ActiveTool::Eraser,
             ActiveTool::Transform,
+            ActiveTool::Burn,
+            ActiveTool::Dodge,
         ] {
             let s = tool.as_str();
             assert_eq!(ActiveTool::from_str(s), tool);
         }
+    }
+
+    #[test]
+    fn test_active_tool_is_shape_and_snapshot_refs() {
+        for tool in [ActiveTool::Line, ActiveTool::Arrow, ActiveTool::Rect, ActiveTool::Ellipse] {
+            assert!(tool.is_shape());
+        }
+        for tool in [
+            ActiveTool::Freehand,
+            ActiveTool::Text,
+            ActiveTool::Emoji,
+            ActiveTool::Eraser,
+            ActiveTool::Transform,
+            ActiveTool::Burn,
+            ActiveTool::Dodge,
+        ] {
+            assert!(!tool.is_shape());
+        }
+
+        let mut mgr = AnnotationManager::new();
+        mgr.start_drawing(ActiveTool::Burn, Point2D::new(10.0, 10.0), [1.0, 1.0, 1.0], 18.0, 0.8, 0.4, false, false, false, false, ScreenEffectMode::Burn, 7);
+        assert!(mgr.finish_drawing()); // Single-click dab supported for Burn/Dodge
+        assert!(ActiveTool::Freehand.supports_softness());
+        assert!(ActiveTool::Burn.supports_softness());
+        assert!(ActiveTool::Dodge.supports_softness());
+        assert!(!ActiveTool::Rect.supports_softness());
+        assert!(!ActiveTool::Emoji.supports_softness());
+        assert!(!ActiveTool::Text.supports_softness());
+        mgr.add_emoji_stamp(Point2D::new(30.0, 30.0), "🔥", 24.0, 1.0, [1.0, 1.0, 1.0, 1.0], true, true, ScreenEffectMode::Invert, 9);
+        assert_eq!(mgr.referenced_snapshot_ids(), vec![7, 9]);
     }
 
     #[test]
@@ -1468,6 +1652,8 @@ mod tests {
             width: 2.0,
             fill: false,
             rotation_rad: 0.0,
+            effect: ScreenEffectMode::Normal,
+            snapshot_id: 0,
         });
         // Shape 1: Ellipse centered at (100, 100), rx=20, ry=20
         mgr.shapes.push(Shape::Ellipse {
@@ -1477,6 +1663,8 @@ mod tests {
             color: [0.0, 1.0, 0.0, 1.0],
             width: 2.0,
             fill: false,
+            effect: ScreenEffectMode::Normal,
+            snapshot_id: 0,
         });
         // Shape 2: Line from (300, 300) to (350, 350)
         mgr.shapes.push(Shape::Line {
@@ -1486,6 +1674,8 @@ mod tests {
             width: 2.0,
             dotted: false,
             wavy: false,
+            effect: ScreenEffectMode::Normal,
+            snapshot_id: 0,
         });
 
         // Marquee from (0, 0) to (130, 130) should select Shape 0 and Shape 1
@@ -1517,6 +1707,8 @@ mod tests {
             width: 2.0,
             fill: false,
             rotation_rad: 0.0,
+            effect: ScreenEffectMode::Normal,
+            snapshot_id: 0,
         });
         mgr.selected_indices = vec![0];
 
@@ -1583,6 +1775,8 @@ mod tests {
             font_size: 24.0,
             color: [1.0, 1.0, 1.0, 1.0],
             rotation_rad: 0.0,
+            effect: ScreenEffectMode::Normal,
+            snapshot_id: 0,
         });
         mgr.selected_indices = vec![0];
         let (min_pt, max_pt) = mgr.get_selection_bounding_box().unwrap();
@@ -1605,6 +1799,8 @@ mod tests {
             [1.0, 0.5, 0.0, 0.8],
             true,
             false,
+            ScreenEffectMode::Normal,
+            0,
         );
         assert_eq!(mgr.shapes.len(), 2);
         if let Shape::Emoji { emoji, flat, filled, opacity, .. } = &mgr.shapes[1] {

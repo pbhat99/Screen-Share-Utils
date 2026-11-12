@@ -1,4 +1,4 @@
-use crate::annotation::{ActiveTool, AnnotationManager};
+use crate::annotation::{ActiveTool, AnnotationManager, ScreenEffectMode};
 use crate::config::AppConfig;
 use crate::geometry::Point2D;
 use crate::keystroke::{KeyHookManager, KeystrokeState};
@@ -224,11 +224,12 @@ impl App {
 
     /// Sync active config from shared config (e.g. when modified in Settings Window)
     pub fn sync_config(&mut self) {
-        if let Ok(c) = self.shared_config.lock() {
+        if let Ok(mut c) = self.shared_config.lock() {
+            // Preserve live floating panel position so Settings Apply/Cancel cannot revert it
+            c.annotation.toolbar_x = self.toolbar.x;
+            c.annotation.toolbar_y = self.toolbar.y;
             self.config = c.clone();
         }
-        self.toolbar.x = self.config.annotation.toolbar_x;
-        self.toolbar.y = self.config.annotation.toolbar_y;
         self.update_emoji_cursor_if_changed();
         self.needs_render = true;
     }
@@ -297,37 +298,68 @@ impl App {
         self.update_tray_tooltip();
     }
 
+    pub fn ensure_screen_snapshot(&mut self) -> usize {
+        if self.renderer.active_snapshot_id == 0 {
+            self.renderer.capture_desktop_snapshot(self.hwnd_overlay)
+        } else {
+            self.renderer.active_snapshot_id
+        }
+    }
+
+    pub fn current_effect_mode(&self) -> ScreenEffectMode {
+        match self.active_tool {
+            ActiveTool::Burn => ScreenEffectMode::Burn,
+            ActiveTool::Dodge => ScreenEffectMode::Dodge,
+            _ if self.config.annotation.invert_color => ScreenEffectMode::Invert,
+            _ => ScreenEffectMode::Normal,
+        }
+    }
+
     pub fn set_drawing_mode(&mut self, enabled: bool) {
         self.is_drawing_mode = enabled;
         self.toolbar.reset_confirmations();
-        self.toolbar.emoji_flyout_open = false;
-        self.toolbar.color_flyout_open = false;
+        self.toolbar.close_flyouts();
+        self.config.annotation.toolbar_x = self.toolbar.x;
+        self.config.annotation.toolbar_y = self.toolbar.y;
         if enabled {
+            self.annotation_mgr.annotations_hidden = false;
             // Mutually exclusive: disable laser and turn off highlighter when entering drawing mode
             self.config.laser.enabled = false;
             self.config.highlighter.enabled = false;
             if self.active_tool == ActiveTool::None {
                 self.active_tool = ActiveTool::from_str(&self.config.annotation.selected_tool);
             }
+            self.config.annotation.load_tool_settings(self.active_tool.as_str());
+            self.renderer.invalidate_active_snapshot();
             // Exclude taskbar so it is always 100% click-through!
-            self.set_click_through(false);
-            self.apply_taskbar_exclusion(true);
+            self.sync_overlay_input_mode();
             unsafe {
                 let _ = SetForegroundWindow(self.hwnd_overlay);
+            }
+            if matches!(self.active_tool, ActiveTool::Burn | ActiveTool::Dodge)
+                || self.config.annotation.invert_color
+            {
+                self.ensure_screen_snapshot();
+            }
+            if let Some(rect) = self.renderer.effect_union_rect(&self.annotation_mgr) {
+                self.renderer.refresh_live_effect_backdrop(self.hwnd_overlay, rect, true);
             }
         } else {
             self.annotation_mgr.commit_active_text();
             self.annotation_mgr.clear_selection();
             self.annotation_mgr.hovered_shape_idx = None;
             if self.active_tool != ActiveTool::None {
+                self.config.annotation.save_tool_settings(self.active_tool.as_str());
                 self.config.annotation.selected_tool = self.active_tool.as_str().to_string();
-                let _ = self.config.save();
             }
+            let _ = self.config.save();
             self.active_tool = ActiveTool::None;
             self.annotation_mgr.in_progress = None;
+            self.renderer.invalidate_active_snapshot();
+            let refs = self.annotation_mgr.referenced_snapshot_ids();
+            self.renderer.prune_snapshots(&refs);
             // Restore full region and enable click-through
-            self.apply_taskbar_exclusion(false);
-            self.set_click_through(true);
+            self.sync_overlay_input_mode();
             // If laser is not active, restore highlighter
             if !self.config.laser.enabled {
                 self.config.highlighter.enabled = true;
@@ -374,14 +406,90 @@ impl App {
         }
     }
 
+    /// Update overlay click-through & HRGN so turning off annotation visibility releases the mouse to the OS
+    /// while keeping the floating drawing panel open and interactive.
+    pub fn sync_overlay_input_mode(&self) {
+        if !self.is_drawing_mode {
+            self.apply_taskbar_exclusion(false);
+            self.set_click_through(true);
+            return;
+        }
+        if self.annotation_mgr.annotations_hidden {
+            unsafe {
+                let mut ex = GetWindowLongPtrW(self.hwnd_overlay, GWL_EXSTYLE);
+                ex &= !(WS_EX_TRANSPARENT.0 as isize);
+                ex |= WS_EX_NOACTIVATE.0 as isize;
+                SetWindowLongPtrW(self.hwnd_overlay, GWL_EXSTYLE, ex);
+
+                let rgn = if self.config.annotation.show_toolbar {
+                    let px = self.toolbar.x.floor() as i32;
+                    let py = self.toolbar.y.floor() as i32;
+                    let pw = self.toolbar.width.ceil() as i32;
+                    let ph = self.toolbar.height.ceil() as i32;
+                    let base = CreateRectRgn(px, py, px + pw, py + ph);
+                    if !base.is_invalid() && self.toolbar.has_open_flyout() {
+                        let fr = self.toolbar.get_flyout_rect();
+                        let frgn = CreateRectRgn(
+                            fr.left.floor() as i32,
+                            fr.top.floor() as i32,
+                            fr.right.ceil() as i32,
+                            fr.bottom.ceil() as i32,
+                        );
+                        if !frgn.is_invalid() {
+                            let _ = CombineRgn(base, base, frgn, RGN_OR);
+                            let _ = DeleteObject(frgn);
+                        }
+                    }
+                    base
+                } else {
+                    CreateRectRgn(0, 0, 0, 0)
+                };
+                if !rgn.is_invalid() {
+                    let _ = SetWindowRgn(self.hwnd_overlay, rgn, TRUE);
+                }
+                let _ = SetWindowPos(
+                    self.hwnd_overlay,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_NOACTIVATE,
+                );
+            }
+        } else {
+            self.set_click_through(false);
+            self.apply_taskbar_exclusion(true);
+        }
+    }
+
     pub fn toggle_drawing_mode(&mut self) {
         let new_state = !self.is_drawing_mode;
         self.set_drawing_mode(new_state);
     }
 
     pub fn set_tool(&mut self, tool: ActiveTool) {
+        if self.active_tool != ActiveTool::None && self.active_tool != tool {
+            self.config.annotation.save_tool_settings(self.active_tool.as_str());
+        }
         self.active_tool = tool;
         self.config.annotation.selected_tool = tool.as_str().to_string();
+        match tool {
+            ActiveTool::Freehand | ActiveTool::Text => {
+                self.config.annotation.last_pen_text = tool.as_str().to_string();
+            }
+            ActiveTool::Burn | ActiveTool::Dodge => {
+                self.config.annotation.last_burn_dodge = tool.as_str().to_string();
+            }
+            ActiveTool::Eraser | ActiveTool::Transform => {
+                self.config.annotation.last_eraser_transform = tool.as_str().to_string();
+            }
+            _ if tool.is_shape() => {
+                self.config.annotation.last_shape_tool = tool.as_str().to_string();
+            }
+            _ => {}
+        }
+        self.config.annotation.load_tool_settings(tool.as_str());
         let _ = self.config.save();
         self.set_drawing_mode(true);
     }
@@ -429,11 +537,13 @@ impl App {
     pub fn set_color_idx(&mut self, idx: usize) {
         if let Some(c) = self.config.annotation.color_presets.get(idx) {
             if self.config.sync_colors {
+                self.config.annotation.invert_color = false;
                 self.config.annotation.current_color = *c;
                 self.config.laser.color = *c;
                 self.config.highlighter.color = *c;
             } else {
                 if self.is_drawing_mode {
+                    self.config.annotation.invert_color = false;
                     self.config.annotation.current_color = *c;
                 } else if self.config.laser.enabled {
                     self.config.laser.color = *c;
@@ -462,11 +572,15 @@ impl App {
 
     pub fn clear_annotations(&mut self) {
         self.annotation_mgr.clear();
+        let refs = self.annotation_mgr.referenced_snapshot_ids();
+        self.renderer.prune_snapshots(&refs);
         self.needs_render = true;
     }
 
     pub fn undo(&mut self) {
         if self.annotation_mgr.undo() {
+            let refs = self.annotation_mgr.referenced_snapshot_ids();
+            self.renderer.prune_snapshots(&refs);
             self.needs_render = true;
         }
     }
@@ -663,7 +777,7 @@ unsafe extern "system" fn controller_wndproc(hwnd: HWND, msg: u32, wparam: WPARA
                 let cur = Point2D::new(pt.x as f32, pt.y as f32);
                 let cursor_moved = cur.distance_to(app.last_rendered_cursor) > 2.0;
 
-                if cursor_moved && (app.config.highlighter.enabled || app.is_drawing_mode) {
+                if cursor_moved && (app.config.highlighter.enabled || (app.is_drawing_mode && !app.annotation_mgr.annotations_hidden)) {
                     app.needs_render = true;
                 }
 
@@ -688,6 +802,15 @@ unsafe extern "system" fn controller_wndproc(hwnd: HWND, msg: u32, wparam: WPARA
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                     );
                     crate::settings_ui::ensure_settings_topmost();
+                }
+
+                // 5b. Live dynamic backdrop refresh for Invert / Burn / Dodge when screen content changes
+                if !(app.is_drawing_mode && app.is_mouse_down) && (app.topmost_tick_counter % 3 == 0) {
+                    if let Some(rect) = app.renderer.effect_union_rect(&app.annotation_mgr) {
+                        if app.renderer.refresh_live_effect_backdrop(app.hwnd_overlay, rect, false) {
+                            app.needs_render = true;
+                        }
+                    }
                 }
 
                 // 6. If dirty, render frame
@@ -715,6 +838,9 @@ unsafe extern "system" fn controller_wndproc(hwnd: HWND, msg: u32, wparam: WPARA
         }
 
         WM_DESTROY => {
+            app.config.annotation.toolbar_x = app.toolbar.x;
+            app.config.annotation.toolbar_y = app.toolbar.y;
+            let _ = app.config.save();
             let _ = PostQuitMessage(0);
             LRESULT(0)
         }
@@ -782,12 +908,19 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
 
     match msg {
         WM_NCHITTEST => {
-            // When in drawing mode: capture mouse ONLY within active desktop work area!
-            // When cursor is over any taskbar, system tray, or Settings Window: pass through immediately!
+            // When in drawing mode with visibility ON: capture mouse within active desktop work areas
+            // When visibility is OFF: capture ONLY the floating control panel and pass everything else to OS!
             if app.is_drawing_mode {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
-                if is_point_over_taskbar(pt) || crate::settings_ui::is_point_over_settings(pt) {
+                if app.annotation_mgr.annotations_hidden {
+                    let client_pt = app.renderer.screen_to_client(Point2D::new(pt.x as f32, pt.y as f32));
+                    if app.config.annotation.show_toolbar && app.toolbar.hit_test(client_pt) {
+                        LRESULT(HTCLIENT as isize)
+                    } else {
+                        LRESULT(HTTRANSPARENT as isize)
+                    }
+                } else if is_point_over_taskbar(pt) || crate::settings_ui::is_point_over_settings(pt) {
                     LRESULT(HTTRANSPARENT as isize)
                 } else {
                     LRESULT(HTCLIENT as isize)
@@ -801,7 +934,9 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
             if app.is_drawing_mode {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
-                if is_point_over_taskbar(pt) || crate::settings_ui::is_point_over_settings(pt) {
+                if app.annotation_mgr.annotations_hidden {
+                    LRESULT(MA_NOACTIVATE as isize)
+                } else if is_point_over_taskbar(pt) || crate::settings_ui::is_point_over_settings(pt) {
                     LRESULT(MA_NOACTIVATEANDEAT as isize)
                 } else {
                     LRESULT(MA_ACTIVATE as isize)
@@ -826,6 +961,8 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                     let cursor = LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default();
                     SetCursor(cursor);
                     LRESULT(1)
+                } else if app.annotation_mgr.annotations_hidden {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
                 } else if app.active_tool == ActiveTool::Eraser {
                     if let Some(c) = app.eraser_cursor {
                         SetCursor(c);
@@ -887,7 +1024,12 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
             let client_pt = app.renderer.screen_to_client(screen_pt);
 
             if app.is_drawing_mode {
-                if app.config.annotation.show_toolbar && app.toolbar.handle_mouse_move(client_pt, &mut app.config) {
+                if app.config.annotation.show_toolbar
+                    && app.toolbar.handle_mouse_move(client_pt, &mut app.config, app.active_tool)
+                {
+                    if app.annotation_mgr.annotations_hidden && app.toolbar.is_dragging {
+                        app.sync_overlay_input_mode();
+                    }
                     if let Ok(mut sc) = app.shared_config.lock() {
                         *sc = app.config.clone();
                     }
@@ -905,6 +1047,11 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                     } else if app.active_tool == ActiveTool::Transform {
                         if app.annotation_mgr.active_transform_handle.is_some() {
                             if app.annotation_mgr.update_transform(client_pt, shift_held) {
+                                if let Some(rect) = app.renderer.effect_union_rect(&app.annotation_mgr) {
+                                    if !app.renderer.has_live_rect_covering(rect) {
+                                        app.renderer.refresh_live_effect_backdrop(app.hwnd_overlay, rect, false);
+                                    }
+                                }
                                 app.needs_render = true;
                             }
                         } else if app.annotation_mgr.marquee_start.is_some() {
@@ -912,6 +1059,11 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                             app.needs_render = true;
                         }
                     } else if app.annotation_mgr.update_drawing(client_pt, shift_held) {
+                        if let Some(rect) = app.renderer.effect_union_rect(&app.annotation_mgr) {
+                            if !app.renderer.has_live_rect_covering(rect) {
+                                app.renderer.refresh_live_effect_backdrop(app.hwnd_overlay, rect, false);
+                            }
+                        }
                         app.needs_render = true;
                     }
                 } else {
@@ -943,7 +1095,8 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
 
             // In Drawing Mode: Check floating toolbar interaction first
             if app.is_drawing_mode {
-                let flyout_was_open = app.toolbar.emoji_flyout_open || app.toolbar.color_flyout_open;
+                let flyout_was_open = app.toolbar.has_open_flyout();
+                let was_hidden = app.annotation_mgr.annotations_hidden;
                 if app.config.annotation.show_toolbar && app.toolbar.hit_test(client_pt) {
                     app.annotation_mgr.commit_active_text();
                     let mut needs_exit = false;
@@ -958,9 +1111,30 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                             unsafe { let _ = SetCapture(hwnd); }
                         }
                         app.update_emoji_cursor_if_changed();
+                        if app.toolbar.pending_open_settings {
+                            app.toolbar.pending_open_settings = false;
+                            app.handle_command(IDM_OPEN_CONFIG);
+                        }
                         if needs_exit {
                             app.set_drawing_mode(false);
+                        } else {
+                            if was_hidden != app.annotation_mgr.annotations_hidden
+                                || flyout_was_open != app.toolbar.has_open_flyout()
+                            {
+                                app.sync_overlay_input_mode();
+                                if was_hidden && !app.annotation_mgr.annotations_hidden {
+                                    unsafe { let _ = SetForegroundWindow(hwnd); }
+                                }
+                            }
+                            if app.current_effect_mode() != ScreenEffectMode::Normal {
+                                app.ensure_screen_snapshot();
+                            }
                         }
+                        if let Some(rect) = app.renderer.effect_union_rect(&app.annotation_mgr) {
+                            app.renderer.refresh_live_effect_backdrop(app.hwnd_overlay, rect, false);
+                        }
+                        let refs = app.annotation_mgr.referenced_snapshot_ids();
+                        app.renderer.prune_snapshots(&refs);
                         if let Ok(mut sc) = app.shared_config.lock() {
                             *sc = app.config.clone();
                         }
@@ -973,16 +1147,22 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                 // dismiss the flyout cleanly without creating an unwanted mark on canvas!
                 if flyout_was_open {
                     app.toolbar.reset_confirmations();
-                    app.toolbar.emoji_flyout_open = false;
-                    app.toolbar.color_flyout_open = false;
+                    app.toolbar.close_flyouts();
+                    if app.annotation_mgr.annotations_hidden {
+                        app.sync_overlay_input_mode();
+                    }
                     app.needs_render = true;
+                    return LRESULT(0);
+                }
+
+                // Guard: never paint onto the canvas while annotations visibility is turned off
+                if app.annotation_mgr.annotations_hidden {
                     return LRESULT(0);
                 }
 
                 // Clicked outside toolbar: reset any pending confirmations and close flyouts
                 app.toolbar.reset_confirmations();
-                app.toolbar.emoji_flyout_open = false;
-                app.toolbar.color_flyout_open = false;
+                app.toolbar.close_flyouts();
 
                 app.is_mouse_down = true;
 
@@ -996,11 +1176,19 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                             app.config.annotation.current_color[2],
                             app.config.annotation.stroke_opacity,
                         ];
+                        let effect = app.current_effect_mode();
+                        let snapshot_id = if effect != ScreenEffectMode::Normal {
+                            app.ensure_screen_snapshot()
+                        } else {
+                            0
+                        };
                         app.annotation_mgr.start_text_input(
                             client_pt,
                             app.config.annotation.font_family.clone(),
                             app.config.annotation.font_size,
                             color_rgba,
+                            effect,
+                            snapshot_id,
                         );
                         unsafe { let _ = SetFocus(hwnd); }
                         app.needs_render = true;
@@ -1064,6 +1252,12 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                         ];
                         let flat = app.config.annotation.emoji_style == "flat";
                         let filled = app.config.annotation.emoji_filled;
+                        let effect = app.current_effect_mode();
+                        let snapshot_id = if effect != ScreenEffectMode::Normal {
+                            app.ensure_screen_snapshot()
+                        } else {
+                            0
+                        };
                         app.annotation_mgr.add_emoji_stamp(
                             client_pt,
                             &emoji,
@@ -1072,7 +1266,16 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                             color_rgba,
                             flat,
                             filled,
+                            effect,
+                            snapshot_id,
                         );
+                        if effect != ScreenEffectMode::Normal {
+                            if let Some(rect) = app.renderer.effect_union_rect(&app.annotation_mgr) {
+                                if !app.renderer.has_live_rect_covering(rect) {
+                                    app.renderer.refresh_live_effect_backdrop(app.hwnd_overlay, rect, false);
+                                }
+                            }
+                        }
                         app.needs_render = true;
                     }
                     ActiveTool::Eraser => {
@@ -1088,17 +1291,33 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                             ActiveTool::Ellipse => app.config.annotation.ellipse_filled,
                             _ => false,
                         };
+                        let effect = app.current_effect_mode();
+                        let snapshot_id = if effect != ScreenEffectMode::Normal {
+                            app.ensure_screen_snapshot()
+                        } else {
+                            0
+                        };
                         app.annotation_mgr.start_drawing(
                             app.active_tool,
                             client_pt,
                             app.config.annotation.current_color,
                             app.config.annotation.stroke_width,
                             app.config.annotation.stroke_opacity,
+                            app.config.annotation.stroke_softness,
                             fill,
                             app.config.annotation.line_dotted,
                             app.config.annotation.line_wavy,
                             app.config.annotation.arrow_wavy,
+                            effect,
+                            snapshot_id,
                         );
+                        if effect != ScreenEffectMode::Normal {
+                            if let Some(rect) = app.renderer.effect_union_rect(&app.annotation_mgr) {
+                                if !app.renderer.has_live_rect_covering(rect) {
+                                    app.renderer.refresh_live_effect_backdrop(app.hwnd_overlay, rect, false);
+                                }
+                            }
+                        }
                         app.needs_render = true;
                     }
                 }
@@ -1125,6 +1344,9 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                     }
                 }
                 if app.toolbar.handle_lbutton_up(&mut app.config) {
+                    if app.annotation_mgr.annotations_hidden {
+                        app.sync_overlay_input_mode();
+                    }
                     if let Ok(mut sc) = app.shared_config.lock() {
                         *sc = app.config.clone();
                     }
@@ -1155,9 +1377,8 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                     app.needs_render = true;
                     return LRESULT(0);
                 }
-                if app.toolbar.emoji_flyout_open || app.toolbar.color_flyout_open {
-                    app.toolbar.emoji_flyout_open = false;
-                    app.toolbar.color_flyout_open = false;
+                if app.toolbar.has_open_flyout() {
+                    app.toolbar.close_flyouts();
                     app.needs_render = true;
                     return LRESULT(0);
                 }
@@ -1208,7 +1429,7 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
         }
 
         WM_KEYDOWN => {
-            if app.is_drawing_mode {
+            if app.is_drawing_mode && !app.annotation_mgr.annotations_hidden {
                 if app.annotation_mgr.active_text.is_some() {
                     if wparam.0 == VK_ESCAPE.0 as usize {
                         app.annotation_mgr.active_text = None;
